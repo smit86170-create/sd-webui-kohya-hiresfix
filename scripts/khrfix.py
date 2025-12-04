@@ -372,11 +372,18 @@ class Scaler(torch.nn.Module):
             else:
                 align_corners = None
 
+        recompute_scale_factor = None
+        if self.recompute_mode == "true":
+            recompute_scale_factor = True
+        elif self.recompute_mode == "false":
+            recompute_scale_factor = False
+
         x_scaled = F.interpolate(
             x,
             size=(new_h, new_w),
             mode=self.scaler,
             align_corners=align_corners,
+            recompute_scale_factor=recompute_scale_factor,
         )
 
         out = self.block(x_scaled, *args, **kwargs)
