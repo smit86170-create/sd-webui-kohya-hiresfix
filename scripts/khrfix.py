@@ -362,6 +362,10 @@ class Scaler(torch.nn.Module):
         h, w = x.shape[-2:]
         new_h = max(1, int(h * self.scale))
         new_w = max(1, int(w * self.scale))
+        # Keep the effective scale factors aligned to the clamped integer output
+        # sizes so that "recompute_scale_factor" applies to the actual resize
+        # ratio instead of the raw user input.
+        scale_factor = (new_h / h, new_w / w)
 
         align_corners = None
         if self.scaler in {"bilinear", "bicubic", "linear", "trilinear"}:
@@ -380,7 +384,7 @@ class Scaler(torch.nn.Module):
 
         x_scaled = F.interpolate(
             x,
-            size=(new_h, new_w),
+            scale_factor=scale_factor,
             mode=self.scaler,
             align_corners=align_corners,
             recompute_scale_factor=recompute_scale_factor,
