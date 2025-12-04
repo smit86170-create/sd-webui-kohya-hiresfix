@@ -191,6 +191,8 @@ class HiresPreset:
         self.keep_unitary_product: bool = False
         self.align_corners_mode: str = "False"
         self.recompute_scale_factor_mode: str = "False"
+        self.smoothing_mode: str = "Авто (по алгоритму)"
+        self.one_pass_mode: str = "Авто (по алгоритму)"
 
         self.resolution_choice: str = RESOLUTION_CHOICES[0]
         self.apply_resolution: bool = False
@@ -232,6 +234,8 @@ class HiresPreset:
             "keep_unitary_product": self.keep_unitary_product,
             "align_corners_mode": self.align_corners_mode,
             "recompute_scale_factor_mode": self.recompute_scale_factor_mode,
+            "smoothing_mode": self.smoothing_mode,
+            "one_pass_mode": self.one_pass_mode,
             "resolution_choice": self.resolution_choice,
             "apply_resolution": self.apply_resolution,
             "adaptive_by_resolution": self.adaptive_by_resolution,
@@ -463,6 +467,8 @@ class KohyaHiresFix(scripts.Script):
         last_keep1 = cfg.get("keep_unitary_product", False)
         last_align_mode = cfg.get("align_corners_mode", "False")
         last_recompute_mode = cfg.get("recompute_scale_factor_mode", "False")
+        last_smoothing_mode = cfg.get("smoothing_mode", "Авто (по алгоритму)")
+        last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
         last_simple_mode = cfg.get("simple_mode", True)
 
         # Legacy fallback
@@ -550,6 +556,12 @@ class KohyaHiresFix(scripts.Script):
                         label="Плавное изменение масштаба (Enhanced)", value=last_smooth_enh, visible=is_enhanced)
                     smooth_scaling_legacy = gr.Checkbox(
                         label="Плавное изменение масштаба (Legacy old)", value=last_smooth_leg, visible=not is_enhanced)
+                    smoothing_mode_select = gr.Dropdown(
+                        choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"],
+                        value=last_smoothing_mode,
+                        label="Использовать логику сглаживания",
+                        info="Позволяет включить сглаживание другого режима (например, Legacy сглаживание в Enhanced)."
+                    )
                     smoothing_curve = gr.Dropdown(
                         choices=["Линейная", "Smoothstep"], value=last_smoothing_curve,
                         label="Кривая сглаживания", visible=is_enhanced)
@@ -563,6 +575,12 @@ class KohyaHiresFix(scripts.Script):
                         label="Только один проход (Enhanced)", value=last_only_enh, visible=is_enhanced)
                     only_one_pass_legacy = gr.Checkbox(
                         label="Только один проход (Legacy old)", value=last_only_leg, visible=not is_enhanced)
+                    one_pass_mode_select = gr.Dropdown(
+                        choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"],
+                        value=last_one_pass_mode,
+                        label="Использовать логику одного прохода",
+                        info="Позволяет применять алгоритм одного прохода из другого режима."
+                    )
 
                 # Validation Warnings
                 with gr.Row():
@@ -728,7 +746,7 @@ class KohyaHiresFix(scripts.Script):
 
             preset_category_filter.change(_update_preset_list_for_category, inputs=[preset_category_filter], outputs=[preset_select])
 
-            def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_c, eo, one_enh, one_leg, k1, al, rc, res, app, ad, ad_p):
+            def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_sel, sm_c, eo, one_enh, one_leg, one_sel, k1, al, rc, res, app, ad, ad_p):
                 name = (name or "").strip()
                 if not name: return gr.update(), gr.update(), "⚠️ Имя?"
                 cat = (cat_in or "").strip() or (cat_filt if cat_filt != "Все" else "Общие")
@@ -736,9 +754,9 @@ class KohyaHiresFix(scripts.Script):
                 base.update({
                     "category": cat, "algo_mode": mode, "d1": int(d1_v), "d2": int(d2_v), "s1": float(s1_v), "s2": float(s2_v),
                     "scaler": str(scl), "downscale": float(dw), "upscale": float(up),
-                    "smooth_scaling_enh": bool(sm_enh), "smooth_scaling_legacy": bool(sm_leg),
+                    "smooth_scaling_enh": bool(sm_enh), "smooth_scaling_legacy": bool(sm_leg), "smoothing_mode": str(sm_sel),
                     "smoothing_curve": str(sm_c), "early_out": bool(eo),
-                    "only_one_pass_enh": bool(one_enh), "only_one_pass_legacy": bool(one_leg),
+                    "only_one_pass_enh": bool(one_enh), "only_one_pass_legacy": bool(one_leg), "one_pass_mode": str(one_sel),
                     "keep_unitary_product": bool(k1), "align_corners_mode": str(al), "recompute_scale_factor_mode": str(rc),
                     "resolution_choice": str(res), "apply_resolution": bool(app), "adaptive_by_resolution": bool(ad), "adaptive_profile": str(ad_p),
                 })
@@ -750,14 +768,14 @@ class KohyaHiresFix(scripts.Script):
                 name = (name or "").strip()
                 pm.reload()
                 preset = pm.get(name)
-                if not preset: return (*[gr.update()]*24, f"⚠️ Не найден: {name}")
+                if not preset: return (*[gr.update()]*26, f"⚠️ Не найден: {name}")
                 p = preset.to_dict()
                 return (
                     p.get("algo_mode", "Enhanced (RU+)"), int(p.get("d1", 3)), int(p.get("d2", 4)), float(p.get("s1", 0.15)), float(p.get("s2", 0.30)),
                     str(p.get("scaler", "bicubic")), float(p.get("downscale", 0.5)), float(p.get("upscale", 2.0)),
-                    bool(p.get("smooth_scaling_enh", True)), bool(p.get("smooth_scaling_legacy", True)),
+                    bool(p.get("smooth_scaling_enh", True)), bool(p.get("smooth_scaling_legacy", True)), str(p.get("smoothing_mode", "Авто (по алгоритму)")),
                     str(p.get("smoothing_curve", "Линейная")), bool(p.get("early_out", False)),
-                    bool(p.get("only_one_pass_enh", True)), bool(p.get("only_one_pass_legacy", True)),
+                    bool(p.get("only_one_pass_enh", True)), bool(p.get("only_one_pass_legacy", True)), str(p.get("one_pass_mode", "Авто (по алгоритму)")),
                     bool(p.get("keep_unitary_product", False)), str(p.get("align_corners_mode", "False")), str(p.get("recompute_scale_factor_mode", "False")),
                     str(p.get("resolution_choice", RESOLUTION_CHOICES[0])), bool(p.get("apply_resolution", False)),
                     bool(p.get("adaptive_by_resolution", True)), str(p.get("adaptive_profile", "Сбалансированный")),
@@ -769,8 +787,8 @@ class KohyaHiresFix(scripts.Script):
                 cats = ["Все"] + pm.categories()
                 return gr.update(choices=cats, value=cat_filt), gr.update(choices=pm.names_for_category(cat_filt), value=None), f"🗑️ Удалён «{name}»."
 
-            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile], outputs=[preset_category_filter, preset_select, preset_status])
-            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, preset_name, preset_category_input, preset_status])
+            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile], outputs=[preset_category_filter, preset_select, preset_status])
+            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, preset_name, preset_category_input, preset_status])
             btn_delete.click(_delete_preset_cb, inputs=[preset_select, preset_category_filter], outputs=[preset_category_filter, preset_select, preset_status])
 
             # 7. Preview
@@ -795,12 +813,13 @@ class KohyaHiresFix(scripts.Script):
             def _export_all_config(*params):
                 config = {
                     "version": "2.4", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
-                    "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "d1": params[5], "d2": params[6],
-                    "s1": params[7], "s2": params[8], "scaler": params[9], "downscale": params[10], "upscale": params[11],
-                    "smooth_scaling_enh": params[12], "smooth_scaling_legacy": params[13], "smoothing_curve": params[14],
-                    "early_out": params[15], "keep_unitary_product": params[16], "align_corners_mode": params[17],
-                    "recompute_scale_factor_mode": params[18], "resolution_choice": params[19], "apply_resolution": params[20],
-                    "adaptive_by_resolution": params[21], "adaptive_profile": params[22],
+                    "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
+                    "d1": params[6], "d2": params[7], "s1": params[8], "s2": params[9], "scaler": params[10],
+                    "downscale": params[11], "upscale": params[12],
+                    "smooth_scaling_enh": params[13], "smooth_scaling_legacy": params[14], "smoothing_mode": params[15], "smoothing_curve": params[16],
+                    "early_out": params[17], "keep_unitary_product": params[18], "align_corners_mode": params[19],
+                    "recompute_scale_factor_mode": params[20], "resolution_choice": params[21], "apply_resolution": params[22],
+                    "adaptive_by_resolution": params[23], "adaptive_profile": params[24],
                 }
                 return json.dumps(config, indent=2, ensure_ascii=False)
 
@@ -810,22 +829,22 @@ class KohyaHiresFix(scripts.Script):
                     return (
                         gr.update(value=config.get("enable", False)), gr.update(value=config.get("simple_mode", True)),
                         gr.update(value=config.get("algo_mode", "Enhanced (RU+)")), gr.update(value=config.get("only_one_pass_enh", True)),
-                        gr.update(value=config.get("only_one_pass_legacy", True)), gr.update(value=config.get("d1", 3)),
+                        gr.update(value=config.get("only_one_pass_legacy", True)), gr.update(value=config.get("one_pass_mode", "Авто (по алгоритму)")), gr.update(value=config.get("d1", 3)),
                         gr.update(value=config.get("d2", 4)), gr.update(value=config.get("s1", 0.15)), gr.update(value=config.get("s2", 0.30)),
                         gr.update(value=config.get("scaler", "bicubic")), gr.update(value=config.get("downscale", 0.5)),
                         gr.update(value=config.get("upscale", 2.0)), gr.update(value=config.get("smooth_scaling_enh", True)),
-                        gr.update(value=config.get("smooth_scaling_legacy", True)), gr.update(value=config.get("smoothing_curve", "Линейная")),
+                        gr.update(value=config.get("smooth_scaling_legacy", True)), gr.update(value=config.get("smoothing_mode", "Авто (по алгоритму)")), gr.update(value=config.get("smoothing_curve", "Линейная")),
                         gr.update(value=config.get("early_out", False)), gr.update(value=config.get("keep_unitary_product", False)),
                         gr.update(value=config.get("align_corners_mode", "False")), gr.update(value=config.get("recompute_scale_factor_mode", "False")),
                         gr.update(value=config.get("resolution_choice", RESOLUTION_CHOICES[0])), gr.update(value=config.get("apply_resolution", False)),
                         gr.update(value=config.get("adaptive_by_resolution", True)), gr.update(value=config.get("adaptive_profile", "Сбалансированный")),
                         "✅ Настройки импортированы"
                     )
-                except Exception as e: return (*[gr.update()]*23, f"❌ Ошибка: {e}")
+                except Exception as e: return (*[gr.update()]*25, f"❌ Ошибка: {e}")
 
             all_params_list = [
-                enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, d1, d2, s1, s2, scaler, downscale, upscale,
-                smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, early_out, keep_unitary_product, align_corners_mode,
+                enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, d1, d2, s1, s2, scaler, downscale, upscale,
+                smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, keep_unitary_product, align_corners_mode,
                 recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile
             ]
             btn_export_config.click(_export_all_config, inputs=all_params_list, outputs=[config_json])
@@ -843,9 +862,9 @@ class KohyaHiresFix(scripts.Script):
         return all_params_list + [debug_mode]
 
     def process(
-        self, p, enable, simple, algo_mode, only_one_pass_enh, only_one_pass_legacy,
+        self, p, enable, simple, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
         d1, d2, s1, s2, scaler, downscale, upscale,
-        smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, early_out,
+        smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
         keep_unitary_product, align_ui, recompute_ui, res_choice, apply_res,
         adapt, adapt_prof, debug_mode_val
     ):
@@ -855,8 +874,8 @@ class KohyaHiresFix(scripts.Script):
             "algo_mode": algo_mode, "simple_mode": simple, "s1": s1, "s2": s2, "d1": d1, "d2": d2,
             "scaler": scaler, "downscale": downscale, "upscale": upscale,
             "smooth_scaling_enh": smooth_scaling_enh, "smooth_scaling_legacy": smooth_scaling_legacy,
-            "smoothing_curve": smoothing_curve, "early_out": early_out,
-            "only_one_pass_enh": only_one_pass_enh, "only_one_pass_legacy": only_one_pass_legacy,
+            "smoothing_mode": smoothing_mode_select, "smoothing_curve": smoothing_curve, "early_out": early_out,
+            "only_one_pass_enh": only_one_pass_enh, "only_one_pass_legacy": only_one_pass_legacy, "one_pass_mode": one_pass_mode_select,
             "keep_unitary_product": keep_unitary_product, "align_corners_mode": align_ui,
             "recompute_scale_factor_mode": recompute_ui, "resolution_choice": res_choice,
             "apply_resolution": apply_res, "adaptive_by_resolution": adapt, "adaptive_profile": adapt_prof,
@@ -916,10 +935,27 @@ class KohyaHiresFix(scripts.Script):
             align_mode = _norm_mode_choice(align_ui, "auto")
             recompute_mode = _norm_mode_choice(recompute_ui, "auto")
 
-        use_smooth_enh = bool(smooth_scaling_enh)
-        use_smooth_legacy = bool(smooth_scaling_legacy)
-        use_one_enh = bool(only_one_pass_enh)
-        use_one_legacy = bool(only_one_pass_legacy)
+        def _select_cross_mode(choice: str, enh_value: bool, legacy_value: bool) -> bool:
+            sel = (choice or "").strip().lower()
+            if sel.startswith("использовать legacy"):
+                return bool(legacy_value)
+            if sel.startswith("использовать enhanced"):
+                return bool(enh_value)
+            return bool(enh_value) if algo_mode == "Enhanced (RU+)" else bool(legacy_value)
+
+        chosen_smoothing = _select_cross_mode(smoothing_mode_select, smooth_scaling_enh, smooth_scaling_legacy)
+        chosen_one_pass = _select_cross_mode(one_pass_mode_select, only_one_pass_enh, only_one_pass_legacy)
+
+        if algo_mode == "Enhanced (RU+)":
+            use_smooth_enh = chosen_smoothing
+            use_one_enh = chosen_one_pass
+            use_smooth_legacy = bool(smooth_scaling_legacy)
+            use_one_legacy = bool(only_one_pass_legacy)
+        else:
+            use_smooth_enh = bool(smooth_scaling_enh)
+            use_one_enh = bool(only_one_pass_enh)
+            use_smooth_legacy = chosen_smoothing
+            use_one_legacy = chosen_one_pass
 
         def denoiser_callback(params: script_callbacks.CFGDenoiserParams):
             total = max(1, int(params.total_sampling_steps))
