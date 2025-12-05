@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -147,8 +148,8 @@ def _compute_adaptive_params(
     elif aspect <= 1.1:
         d_add -= 1
 
-    s1 = _clamp(s1 + s_add * 0.7, 0.0, 0.5)
-    s2 = _clamp(s2 + s_add, 0.0, 0.5)
+    s1 = _clamp(s1 + s_add * 0.7, 0.0, 1.0)
+    s2 = _clamp(s2 + s_add, 0.0, 1.0)
 
     d1 = max(1, d1 + d_add)
     d2 = max(1, d2 + d_add)
@@ -454,13 +455,25 @@ class KohyaHiresFix(scripts.Script):
         last_apply_resolution = cfg.get("apply_resolution", False)
         last_adaptive_by_resolution = cfg.get("adaptive_by_resolution", True)
         last_adaptive_profile = cfg.get("adaptive_profile", "Сбалансированный")
-        last_s1 = cfg.get("s1", 0.15)
-        last_s2 = cfg.get("s2", 0.30)
-        last_d1 = cfg.get("d1", 3)
-        last_d2 = cfg.get("d2", 4)
+        def _coerce_int(val, default: int) -> int:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return int(default)
+
+        def _coerce_float(val, default: float) -> float:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return float(default)
+
+        last_s1 = _coerce_float(cfg.get("s1", 0.15), 0.15)
+        last_s2 = _coerce_float(cfg.get("s2", 0.30), 0.30)
+        last_d1 = _coerce_int(cfg.get("d1", 3), 3)
+        last_d2 = _coerce_int(cfg.get("d2", 4), 4)
         last_scaler = cfg.get("scaler", "bicubic")
-        last_downscale = cfg.get("downscale", 0.5)
-        last_upscale = cfg.get("upscale", 2.0)
+        last_downscale = _coerce_float(cfg.get("downscale", 0.5), 0.5)
+        last_upscale = _coerce_float(cfg.get("upscale", 2.0), 2.0)
         last_smooth_enh = cfg.get("smooth_scaling_enh", True)
         last_smooth_leg = cfg.get("smooth_scaling_legacy", True)
         last_only_enh = cfg.get("only_one_pass_enh", True)
@@ -474,6 +487,8 @@ class KohyaHiresFix(scripts.Script):
         last_smoothing_mode = cfg.get("smoothing_mode", "Авто (по алгоритму)")
         last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
         last_simple_mode = cfg.get("simple_mode", True)
+        last_stop_preview_enabled = cfg.get("stop_preview_enabled", False)
+        last_stop_preview_steps = _coerce_int(cfg.get("stop_preview_steps", 30), 30)
 
         # Legacy fallback
         legacy_smooth = cfg.get("smooth_scaling", None)
@@ -486,6 +501,21 @@ class KohyaHiresFix(scripts.Script):
             last_only_leg = bool(legacy_one)
 
         is_enhanced = (last_algo_mode == "Enhanced (RU+)")
+
+        def _format_stop_preview_text(total_steps: int, s1_v: float, s2_v: float) -> str:
+            total = max(1, int(total_steps))
+            lines = [f"Всего шагов (Sampling Steps): **{total}**"]
+
+            def _line(label: str, ratio: float) -> str:
+                safe_ratio = max(0.0, float(ratio))
+                if safe_ratio <= 0:
+                    return f"{label}: значение 0 → эффект не применяется"
+                stop_step = max(0, math.ceil(total * safe_ratio))
+                return f"{label}: эффект прекращается на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
+
+            lines.append(_line("Пара 1 (s1)", s1_v))
+            lines.append(_line("Пара 2 (s2)", s2_v))
+            return "\n".join(lines)
 
         with gr.Accordion(label="Kohya Hires.fix", open=False):
             
@@ -534,15 +564,31 @@ class KohyaHiresFix(scripts.Script):
             with gr.Group():
                 gr.Markdown("**Базовые параметры hires.fix**")
                 with gr.Row():
-                    s1 = gr.Slider(0.0, 0.5, step=0.01, label="Остановить на (доля шага) — Пара 1", value=last_s1,
-                                   info="На какой доле шагов (0.0-0.5) начать применять downscale для первой пары блоков")
+                    s1 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 1", value=last_s1,
+                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для первой пары блоков")
                     d1 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 1", value=last_d1,
                                    info="Индекс блока UNet (1-10). Меньше = раньше в сети")
                 with gr.Row():
-                    s2 = gr.Slider(0.0, 0.5, step=0.01, label="Остановить на (доля шага) — Пара 2", value=last_s2,
-                                   info="На какой доле шагов (0.0-0.5) начать применять downscale для второй пары блоков")
+                    s2 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 2", value=last_s2,
+                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для второй пары блоков")
                     d2 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 2", value=last_d2,
                                    info="Индекс блока UNet (1-10). Меньше = раньше в сети")
+
+                with gr.Row():
+                    stop_preview_toggle = gr.Checkbox(
+                        label="Показывать визуализацию шага остановки",
+                        value=last_stop_preview_enabled,
+                        info="Вспомогательный расчёт шага, на котором прекращается эффект для выбранных s1/s2",
+                    )
+                    stop_preview_steps = gr.Slider(
+                        1, 200, step=1, label="Всего шагов (Sampling Steps)", value=last_stop_preview_steps,
+                        visible=last_stop_preview_enabled,
+                        info="Общее число шагов семплера для расчёта шага остановки",
+                    )
+                stop_preview_md = gr.Markdown(
+                    value=_format_stop_preview_text(last_stop_preview_steps, last_s1, last_s2) if last_stop_preview_enabled else "",
+                    visible=last_stop_preview_enabled,
+                )
 
                 with gr.Row():
                     depth_guard = gr.Checkbox(
@@ -670,6 +716,7 @@ class KohyaHiresFix(scripts.Script):
                 gr.Markdown("""
                   ### 📖 Описание параметров:
                   **Базовые:**
+                  - **s1, s2**: Доля шагов (0.0-1.0), когда начинать применять эффект.
                   - **s1, s2**: Доля шагов (0.0-0.5), когда начинать применять эффект.
                   - **d1, d2**: Глубина блоков UNet (1-10). Меньшие значения = ранние слои.
                   - **Автокоррекция глубины**: автоматически ограничивает индексы доступными блоками и при необходимости упорядочивает d1 и d2.
@@ -688,21 +735,58 @@ class KohyaHiresFix(scripts.Script):
 
             # 1. Validation Logic
             def _validate_params(d1_v, d2_v, s1_v, s2_v, down_v, up_v, keep1):
+                def _num_or_none(func, val):
+                    try:
+                        return func(val)
+                    except (TypeError, ValueError):
+                        return None
+
+                d1_i = _num_or_none(int, d1_v)
+                d2_i = _num_or_none(int, d2_v)
+                s1_f = _num_or_none(float, s1_v)
+                s2_f = _num_or_none(float, s2_v)
+                down_f = _num_or_none(float, down_v)
+                up_f = _num_or_none(float, up_v)
+
+                if None in (d1_i, d2_i, s1_f, s2_f, down_f, up_f):
+                    return "⚠️ Заполните все значения: одно или несколько полей не распознаны"
+
                 warnings = []
-                if d1_v == d2_v and abs(s1_v - s2_v) > 0.01:
+                if d1_i == d2_i and abs(s1_f - s2_f) > 0.01:
                     warnings.append("⚠️ **d1 == d2**, но **s1 ≠ s2**: будет использован max(s1, s2)")
-                if s1_v > s2_v:
+                if s1_f > s2_f:
                     warnings.append("⚠️ **s1 > s2**: параметры будут автоматически скорректированы")
-                if s1_v == 0 and s2_v == 0:
+                if s1_f == 0 and s2_f == 0:
                     warnings.append("⚠️ **s1 и s2 равны 0**: эффект не применится")
-                if keep1 and abs(down_v * up_v - 1.0) > 0.1:
-                    warnings.append(f"ℹ️ down×up будет скорректирован до 1.0 (сейчас {down_v*up_v:.2f})")
+                if keep1 and abs(down_f * up_f - 1.0) > 0.1:
+                    warnings.append(f"ℹ️ down×up будет скорректирован до 1.0 (сейчас {down_f*up_f:.2f})")
                 return "\n".join(warnings) if warnings else "✅ **Параметры корректны**"
 
             for param in [d1, d2, s1, s2, downscale, upscale, keep_unitary_product]:
-                param.change(_validate_params, 
-                             inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product], 
+                param.change(_validate_params,
+                             inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product],
                              outputs=[param_warnings])
+
+            def _render_stop_preview(enabled, total_steps, s1_v, s2_v):
+                if not enabled:
+                    return gr.update(visible=False, value="")
+                return gr.update(visible=True, value=_format_stop_preview_text(total_steps, s1_v, s2_v))
+
+            def _toggle_stop_preview(enabled, total_steps, s1_v, s2_v):
+                return gr.update(visible=enabled), _render_stop_preview(enabled, total_steps, s1_v, s2_v)
+
+            stop_preview_toggle.change(
+                _toggle_stop_preview,
+                inputs=[stop_preview_toggle, stop_preview_steps, s1, s2],
+                outputs=[stop_preview_steps, stop_preview_md],
+            )
+
+            for trigger in (stop_preview_steps, s1, s2):
+                trigger.change(
+                    _render_stop_preview,
+                    inputs=[stop_preview_toggle, stop_preview_steps, s1, s2],
+                    outputs=[stop_preview_md],
+                )
 
             # 2. Status Indicator
             def _update_status(enabled: bool, mode: str):
@@ -827,6 +911,13 @@ class KohyaHiresFix(scripts.Script):
                 config = {
                     "version": "2.4", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
                     "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
+                    "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10],
+                    "stop_preview_enabled": params[11], "stop_preview_steps": params[12], "scaler": params[13],
+                    "downscale": params[14], "upscale": params[15],
+                    "smooth_scaling_enh": params[16], "smooth_scaling_legacy": params[17], "smoothing_mode": params[18], "smoothing_curve": params[19],
+                    "early_out": params[20], "keep_unitary_product": params[21], "align_corners_mode": params[22],
+                    "recompute_scale_factor_mode": params[23], "resolution_choice": params[24], "apply_resolution": params[25],
+                    "adaptive_by_resolution": params[26], "adaptive_profile": params[27],
                     "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10], "scaler": params[11],
                     "downscale": params[12], "upscale": params[13],
                     "smooth_scaling_enh": params[14], "smooth_scaling_legacy": params[15], "smoothing_mode": params[16], "smoothing_curve": params[17],
@@ -844,6 +935,7 @@ class KohyaHiresFix(scripts.Script):
                         gr.update(value=config.get("algo_mode", "Enhanced (RU+)")), gr.update(value=config.get("only_one_pass_enh", True)),
                         gr.update(value=config.get("only_one_pass_legacy", True)), gr.update(value=config.get("one_pass_mode", "Авто (по алгоритму)")), gr.update(value=config.get("d1", 3)),
                         gr.update(value=config.get("d2", 4)), gr.update(value=config.get("depth_guard", True)), gr.update(value=config.get("s1", 0.15)), gr.update(value=config.get("s2", 0.30)),
+                        gr.update(value=config.get("stop_preview_enabled", False)), gr.update(value=int(config.get("stop_preview_steps", 30))),
                         gr.update(value=config.get("scaler", "bicubic")), gr.update(value=config.get("downscale", 0.5)),
                         gr.update(value=config.get("upscale", 2.0)), gr.update(value=config.get("smooth_scaling_enh", True)),
                         gr.update(value=config.get("smooth_scaling_legacy", True)), gr.update(value=config.get("smoothing_mode", "Авто (по алгоритму)")), gr.update(value=config.get("smoothing_curve", "Линейная")),
@@ -853,6 +945,11 @@ class KohyaHiresFix(scripts.Script):
                         gr.update(value=config.get("adaptive_by_resolution", True)), gr.update(value=config.get("adaptive_profile", "Сбалансированный")),
                         "✅ Настройки импортированы"
                     )
+                except Exception as e: return (*[gr.update()]*28, f"❌ Ошибка: {e}")
+
+            all_params_list = [
+                enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
+                d1, d2, depth_guard, s1, s2, stop_preview_toggle, stop_preview_steps, scaler, downscale, upscale,
                 except Exception as e: return (*[gr.update()]*26, f"❌ Ошибка: {e}")
 
             all_params_list = [
@@ -876,6 +973,7 @@ class KohyaHiresFix(scripts.Script):
 
     def process(
         self, p, enable, simple, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
+        d1, d2, depth_guard, s1, s2, stop_preview_enabled, stop_preview_steps, scaler, downscale, upscale,
         d1, d2, depth_guard, s1, s2, scaler, downscale, upscale,
         smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
         keep_unitary_product, align_ui, recompute_ui, res_choice, apply_res,
@@ -886,6 +984,7 @@ class KohyaHiresFix(scripts.Script):
         self.config = DictConfig({
             "algo_mode": algo_mode, "simple_mode": simple, "s1": s1, "s2": s2, "d1": d1, "d2": d2,
             "depth_guard": depth_guard,
+            "stop_preview_enabled": stop_preview_enabled, "stop_preview_steps": stop_preview_steps,
             "scaler": scaler, "downscale": downscale, "upscale": upscale,
             "smooth_scaling_enh": smooth_scaling_enh, "smooth_scaling_legacy": smooth_scaling_legacy,
             "smoothing_mode": smoothing_mode_select, "smoothing_curve": smoothing_curve, "early_out": early_out,
@@ -913,7 +1012,7 @@ class KohyaHiresFix(scripts.Script):
             except: pass
             return
 
-        use_s1, use_s2 = float(s1), float(s2)
+        use_s1, use_s2 = _clamp(float(s1), 0.0, 1.0), _clamp(float(s2), 0.0, 1.0)
         use_d1, use_d2 = int(d1), int(d2)
         use_down, use_up = float(downscale), float(upscale)
         depth_guard = bool(depth_guard)
@@ -922,7 +1021,7 @@ class KohyaHiresFix(scripts.Script):
             try:
                 use_s1, use_s2, use_d1, use_d2, use_down, use_up = _compute_adaptive_params(
                     int(getattr(p, "width", 1024)), int(getattr(p, "height", 1024)), adapt_prof,
-                    s1, s2, d1, d2, downscale, upscale, keep_unitary_product
+                    use_s1, use_s2, d1, d2, downscale, upscale, keep_unitary_product
                 )
             except: pass
 
