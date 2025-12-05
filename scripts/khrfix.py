@@ -455,13 +455,25 @@ class KohyaHiresFix(scripts.Script):
         last_apply_resolution = cfg.get("apply_resolution", False)
         last_adaptive_by_resolution = cfg.get("adaptive_by_resolution", True)
         last_adaptive_profile = cfg.get("adaptive_profile", "Сбалансированный")
-        last_s1 = cfg.get("s1", 0.15)
-        last_s2 = cfg.get("s2", 0.30)
-        last_d1 = cfg.get("d1", 3)
-        last_d2 = cfg.get("d2", 4)
+        def _coerce_int(val, default: int) -> int:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return int(default)
+
+        def _coerce_float(val, default: float) -> float:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return float(default)
+
+        last_s1 = _coerce_float(cfg.get("s1", 0.15), 0.15)
+        last_s2 = _coerce_float(cfg.get("s2", 0.30), 0.30)
+        last_d1 = _coerce_int(cfg.get("d1", 3), 3)
+        last_d2 = _coerce_int(cfg.get("d2", 4), 4)
         last_scaler = cfg.get("scaler", "bicubic")
-        last_downscale = cfg.get("downscale", 0.5)
-        last_upscale = cfg.get("upscale", 2.0)
+        last_downscale = _coerce_float(cfg.get("downscale", 0.5), 0.5)
+        last_upscale = _coerce_float(cfg.get("upscale", 2.0), 2.0)
         last_smooth_enh = cfg.get("smooth_scaling_enh", True)
         last_smooth_leg = cfg.get("smooth_scaling_legacy", True)
         last_only_enh = cfg.get("only_one_pass_enh", True)
@@ -476,7 +488,7 @@ class KohyaHiresFix(scripts.Script):
         last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
         last_simple_mode = cfg.get("simple_mode", True)
         last_stop_preview_enabled = cfg.get("stop_preview_enabled", False)
-        last_stop_preview_steps = int(cfg.get("stop_preview_steps", 30))
+        last_stop_preview_steps = _coerce_int(cfg.get("stop_preview_steps", 30), 30)
 
         # Legacy fallback
         legacy_smooth = cfg.get("smooth_scaling", None)
@@ -722,15 +734,31 @@ class KohyaHiresFix(scripts.Script):
 
             # 1. Validation Logic
             def _validate_params(d1_v, d2_v, s1_v, s2_v, down_v, up_v, keep1):
+                def _num_or_none(func, val):
+                    try:
+                        return func(val)
+                    except (TypeError, ValueError):
+                        return None
+
+                d1_i = _num_or_none(int, d1_v)
+                d2_i = _num_or_none(int, d2_v)
+                s1_f = _num_or_none(float, s1_v)
+                s2_f = _num_or_none(float, s2_v)
+                down_f = _num_or_none(float, down_v)
+                up_f = _num_or_none(float, up_v)
+
+                if None in (d1_i, d2_i, s1_f, s2_f, down_f, up_f):
+                    return "⚠️ Заполните все значения: одно или несколько полей не распознаны"
+
                 warnings = []
-                if d1_v == d2_v and abs(s1_v - s2_v) > 0.01:
+                if d1_i == d2_i and abs(s1_f - s2_f) > 0.01:
                     warnings.append("⚠️ **d1 == d2**, но **s1 ≠ s2**: будет использован max(s1, s2)")
-                if s1_v > s2_v:
+                if s1_f > s2_f:
                     warnings.append("⚠️ **s1 > s2**: параметры будут автоматически скорректированы")
-                if s1_v == 0 and s2_v == 0:
+                if s1_f == 0 and s2_f == 0:
                     warnings.append("⚠️ **s1 и s2 равны 0**: эффект не применится")
-                if keep1 and abs(down_v * up_v - 1.0) > 0.1:
-                    warnings.append(f"ℹ️ down×up будет скорректирован до 1.0 (сейчас {down_v*up_v:.2f})")
+                if keep1 and abs(down_f * up_f - 1.0) > 0.1:
+                    warnings.append(f"ℹ️ down×up будет скорректирован до 1.0 (сейчас {down_f*up_f:.2f})")
                 return "\n".join(warnings) if warnings else "✅ **Параметры корректны**"
 
             for param in [d1, d2, s1, s2, downscale, upscale, keep_unitary_product]:
