@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -147,8 +148,8 @@ def _compute_adaptive_params(
     elif aspect <= 1.1:
         d_add -= 1
 
-    s1 = _clamp(s1 + s_add * 0.7, 0.0, 0.5)
-    s2 = _clamp(s2 + s_add, 0.0, 0.5)
+    s1 = _clamp(s1 + s_add * 0.7, 0.0, 1.0)
+    s2 = _clamp(s2 + s_add, 0.0, 1.0)
 
     d1 = max(1, d1 + d_add)
     d2 = max(1, d2 + d_add)
@@ -187,6 +188,8 @@ class HiresPreset:
 
         self.only_one_pass_enh: bool = True
         self.only_one_pass_legacy: bool = True
+
+        self.depth_guard: bool = True
 
         self.keep_unitary_product: bool = False
         self.align_corners_mode: str = "False"
@@ -231,6 +234,7 @@ class HiresPreset:
             "early_out": self.early_out,
             "only_one_pass_enh": self.only_one_pass_enh,
             "only_one_pass_legacy": self.only_one_pass_legacy,
+            "depth_guard": self.depth_guard,
             "keep_unitary_product": self.keep_unitary_product,
             "align_corners_mode": self.align_corners_mode,
             "recompute_scale_factor_mode": self.recompute_scale_factor_mode,
@@ -462,6 +466,7 @@ class KohyaHiresFix(scripts.Script):
         last_smooth_leg = cfg.get("smooth_scaling_legacy", True)
         last_only_enh = cfg.get("only_one_pass_enh", True)
         last_only_leg = cfg.get("only_one_pass_legacy", True)
+        last_depth_guard = cfg.get("depth_guard", True)
         last_smoothing_curve = cfg.get("smoothing_curve", "Линейная")
         last_early_out = cfg.get("early_out", False)
         last_keep1 = cfg.get("keep_unitary_product", False)
@@ -470,6 +475,8 @@ class KohyaHiresFix(scripts.Script):
         last_smoothing_mode = cfg.get("smoothing_mode", "Авто (по алгоритму)")
         last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
         last_simple_mode = cfg.get("simple_mode", True)
+        last_stop_preview_enabled = cfg.get("stop_preview_enabled", False)
+        last_stop_preview_steps = int(cfg.get("stop_preview_steps", 30))
 
         # Legacy fallback
         legacy_smooth = cfg.get("smooth_scaling", None)
@@ -482,6 +489,21 @@ class KohyaHiresFix(scripts.Script):
             last_only_leg = bool(legacy_one)
 
         is_enhanced = (last_algo_mode == "Enhanced (RU+)")
+
+        def _format_stop_preview_text(total_steps: int, s1_v: float, s2_v: float) -> str:
+            total = max(1, int(total_steps))
+            lines = [f"Всего шагов (Sampling Steps): **{total}**"]
+
+            def _line(label: str, ratio: float) -> str:
+                safe_ratio = max(0.0, float(ratio))
+                if safe_ratio <= 0:
+                    return f"{label}: значение 0 → эффект не применяется"
+                stop_step = max(0, math.ceil(total * safe_ratio))
+                return f"{label}: эффект прекращается на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
+
+            lines.append(_line("Пара 1 (s1)", s1_v))
+            lines.append(_line("Пара 2 (s2)", s2_v))
+            return "\n".join(lines)
 
         with gr.Accordion(label="Kohya Hires.fix", open=False):
             
@@ -530,15 +552,38 @@ class KohyaHiresFix(scripts.Script):
             with gr.Group():
                 gr.Markdown("**Базовые параметры hires.fix**")
                 with gr.Row():
-                    s1 = gr.Slider(0.0, 0.5, step=0.01, label="Остановить на (доля шага) — Пара 1", value=last_s1,
-                                   info="На какой доле шагов (0.0-0.5) начать применять downscale для первой пары блоков")
+                    s1 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 1", value=last_s1,
+                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для первой пары блоков")
                     d1 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 1", value=last_d1,
                                    info="Индекс блока UNet (1-10). Меньше = раньше в сети")
                 with gr.Row():
-                    s2 = gr.Slider(0.0, 0.5, step=0.01, label="Остановить на (доля шага) — Пара 2", value=last_s2,
-                                   info="На какой доле шагов (0.0-0.5) начать применять downscale для второй пары блоков")
+                    s2 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 2", value=last_s2,
+                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для второй пары блоков")
                     d2 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 2", value=last_d2,
                                    info="Индекс блока UNet (1-10). Меньше = раньше в сети")
+
+                with gr.Row():
+                    stop_preview_toggle = gr.Checkbox(
+                        label="Показывать визуализацию шага остановки",
+                        value=last_stop_preview_enabled,
+                        info="Вспомогательный расчёт шага, на котором прекращается эффект для выбранных s1/s2",
+                    )
+                    stop_preview_steps = gr.Slider(
+                        1, 200, step=1, label="Всего шагов (Sampling Steps)", value=last_stop_preview_steps,
+                        visible=last_stop_preview_enabled,
+                        info="Общее число шагов семплера для расчёта шага остановки",
+                    )
+                stop_preview_md = gr.Markdown(
+                    value=_format_stop_preview_text(last_stop_preview_steps, last_s1, last_s2) if last_stop_preview_enabled else "",
+                    visible=last_stop_preview_enabled,
+                )
+
+                with gr.Row():
+                    depth_guard = gr.Checkbox(
+                        label="Автокоррекция глубины блоков",
+                        value=last_depth_guard,
+                        info="Ограничивает выбранные индексы допустимым диапазоном модели и сортирует d1/d2 при необходимости",
+                    )
 
                 with gr.Row():
                     scaler = gr.Dropdown(
@@ -657,11 +702,12 @@ class KohyaHiresFix(scripts.Script):
             # --- Accordion: Help ---
             with gr.Accordion("ℹ️ Справка и советы", open=False):
                 gr.Markdown("""
-                ### 📖 Описание параметров:
-                **Базовые:**
-                - **s1, s2**: Доля шагов (0.0-0.5), когда начинать применять эффект.
-                - **d1, d2**: Глубина блоков UNet (1-10). Меньшие значения = ранние слои.
-                - **downscale**: Уменьшение размера на входе. 0.5 = половина размера.
+                  ### 📖 Описание параметров:
+                  **Базовые:**
+                  - **s1, s2**: Доля шагов (0.0-1.0), когда начинать применять эффект.
+                  - **d1, d2**: Глубина блоков UNet (1-10). Меньшие значения = ранние слои.
+                  - **Автокоррекция глубины**: автоматически ограничивает индексы доступными блоками и при необходимости упорядочивает d1 и d2.
+                  - **downscale**: Уменьшение размера на входе. 0.5 = половина размера.
                 
                 **Режимы:**
                 - **Enhanced (RU+)**: Современный алгоритм с плавным масштабированием.
@@ -688,9 +734,30 @@ class KohyaHiresFix(scripts.Script):
                 return "\n".join(warnings) if warnings else "✅ **Параметры корректны**"
 
             for param in [d1, d2, s1, s2, downscale, upscale, keep_unitary_product]:
-                param.change(_validate_params, 
-                             inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product], 
+                param.change(_validate_params,
+                             inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product],
                              outputs=[param_warnings])
+
+            def _render_stop_preview(enabled, total_steps, s1_v, s2_v):
+                if not enabled:
+                    return gr.update(visible=False, value="")
+                return gr.update(visible=True, value=_format_stop_preview_text(total_steps, s1_v, s2_v))
+
+            def _toggle_stop_preview(enabled, total_steps, s1_v, s2_v):
+                return gr.update(visible=enabled), _render_stop_preview(enabled, total_steps, s1_v, s2_v)
+
+            stop_preview_toggle.change(
+                _toggle_stop_preview,
+                inputs=[stop_preview_toggle, stop_preview_steps, s1, s2],
+                outputs=[stop_preview_steps, stop_preview_md],
+            )
+
+            for trigger in (stop_preview_steps, s1, s2):
+                trigger.change(
+                    _render_stop_preview,
+                    inputs=[stop_preview_toggle, stop_preview_steps, s1, s2],
+                    outputs=[stop_preview_md],
+                )
 
             # 2. Status Indicator
             def _update_status(enabled: bool, mode: str):
@@ -746,13 +813,13 @@ class KohyaHiresFix(scripts.Script):
 
             preset_category_filter.change(_update_preset_list_for_category, inputs=[preset_category_filter], outputs=[preset_select])
 
-            def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_sel, sm_c, eo, one_enh, one_leg, one_sel, k1, al, rc, res, app, ad, ad_p):
+            def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, depth_guard_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_sel, sm_c, eo, one_enh, one_leg, one_sel, k1, al, rc, res, app, ad, ad_p):
                 name = (name or "").strip()
                 if not name: return gr.update(), gr.update(), "⚠️ Имя?"
                 cat = (cat_in or "").strip() or (cat_filt if cat_filt != "Все" else "Общие")
                 base = HiresPreset().to_dict()
                 base.update({
-                    "category": cat, "algo_mode": mode, "d1": int(d1_v), "d2": int(d2_v), "s1": float(s1_v), "s2": float(s2_v),
+                    "category": cat, "algo_mode": mode, "d1": int(d1_v), "d2": int(d2_v), "depth_guard": bool(depth_guard_v), "s1": float(s1_v), "s2": float(s2_v),
                     "scaler": str(scl), "downscale": float(dw), "upscale": float(up),
                     "smooth_scaling_enh": bool(sm_enh), "smooth_scaling_legacy": bool(sm_leg), "smoothing_mode": str(sm_sel),
                     "smoothing_curve": str(sm_c), "early_out": bool(eo),
@@ -771,7 +838,8 @@ class KohyaHiresFix(scripts.Script):
                 if not preset: return (*[gr.update()]*26, f"⚠️ Не найден: {name}")
                 p = preset.to_dict()
                 return (
-                    p.get("algo_mode", "Enhanced (RU+)"), int(p.get("d1", 3)), int(p.get("d2", 4)), float(p.get("s1", 0.15)), float(p.get("s2", 0.30)),
+                    p.get("algo_mode", "Enhanced (RU+)").strip(), int(p.get("d1", 3)), int(p.get("d2", 4)), bool(p.get("depth_guard", True)),
+                    float(p.get("s1", 0.15)), float(p.get("s2", 0.30)),
                     str(p.get("scaler", "bicubic")), float(p.get("downscale", 0.5)), float(p.get("upscale", 2.0)),
                     bool(p.get("smooth_scaling_enh", True)), bool(p.get("smooth_scaling_legacy", True)), str(p.get("smoothing_mode", "Авто (по алгоритму)")),
                     str(p.get("smoothing_curve", "Линейная")), bool(p.get("early_out", False)),
@@ -787,8 +855,8 @@ class KohyaHiresFix(scripts.Script):
                 cats = ["Все"] + pm.categories()
                 return gr.update(choices=cats, value=cat_filt), gr.update(choices=pm.names_for_category(cat_filt), value=None), f"🗑️ Удалён «{name}»."
 
-            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile], outputs=[preset_category_filter, preset_select, preset_status])
-            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, preset_name, preset_category_input, preset_status])
+            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile], outputs=[preset_category_filter, preset_select, preset_status])
+            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, preset_name, preset_category_input, preset_status])
             btn_delete.click(_delete_preset_cb, inputs=[preset_select, preset_category_filter], outputs=[preset_category_filter, preset_select, preset_status])
 
             # 7. Preview
@@ -814,12 +882,13 @@ class KohyaHiresFix(scripts.Script):
                 config = {
                     "version": "2.4", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
                     "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
-                    "d1": params[6], "d2": params[7], "s1": params[8], "s2": params[9], "scaler": params[10],
-                    "downscale": params[11], "upscale": params[12],
-                    "smooth_scaling_enh": params[13], "smooth_scaling_legacy": params[14], "smoothing_mode": params[15], "smoothing_curve": params[16],
-                    "early_out": params[17], "keep_unitary_product": params[18], "align_corners_mode": params[19],
-                    "recompute_scale_factor_mode": params[20], "resolution_choice": params[21], "apply_resolution": params[22],
-                    "adaptive_by_resolution": params[23], "adaptive_profile": params[24],
+                    "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10],
+                    "stop_preview_enabled": params[11], "stop_preview_steps": params[12], "scaler": params[13],
+                    "downscale": params[14], "upscale": params[15],
+                    "smooth_scaling_enh": params[16], "smooth_scaling_legacy": params[17], "smoothing_mode": params[18], "smoothing_curve": params[19],
+                    "early_out": params[20], "keep_unitary_product": params[21], "align_corners_mode": params[22],
+                    "recompute_scale_factor_mode": params[23], "resolution_choice": params[24], "apply_resolution": params[25],
+                    "adaptive_by_resolution": params[26], "adaptive_profile": params[27],
                 }
                 return json.dumps(config, indent=2, ensure_ascii=False)
 
@@ -830,7 +899,8 @@ class KohyaHiresFix(scripts.Script):
                         gr.update(value=config.get("enable", False)), gr.update(value=config.get("simple_mode", True)),
                         gr.update(value=config.get("algo_mode", "Enhanced (RU+)")), gr.update(value=config.get("only_one_pass_enh", True)),
                         gr.update(value=config.get("only_one_pass_legacy", True)), gr.update(value=config.get("one_pass_mode", "Авто (по алгоритму)")), gr.update(value=config.get("d1", 3)),
-                        gr.update(value=config.get("d2", 4)), gr.update(value=config.get("s1", 0.15)), gr.update(value=config.get("s2", 0.30)),
+                        gr.update(value=config.get("d2", 4)), gr.update(value=config.get("depth_guard", True)), gr.update(value=config.get("s1", 0.15)), gr.update(value=config.get("s2", 0.30)),
+                        gr.update(value=config.get("stop_preview_enabled", False)), gr.update(value=int(config.get("stop_preview_steps", 30))),
                         gr.update(value=config.get("scaler", "bicubic")), gr.update(value=config.get("downscale", 0.5)),
                         gr.update(value=config.get("upscale", 2.0)), gr.update(value=config.get("smooth_scaling_enh", True)),
                         gr.update(value=config.get("smooth_scaling_legacy", True)), gr.update(value=config.get("smoothing_mode", "Авто (по алгоритму)")), gr.update(value=config.get("smoothing_curve", "Линейная")),
@@ -840,10 +910,11 @@ class KohyaHiresFix(scripts.Script):
                         gr.update(value=config.get("adaptive_by_resolution", True)), gr.update(value=config.get("adaptive_profile", "Сбалансированный")),
                         "✅ Настройки импортированы"
                     )
-                except Exception as e: return (*[gr.update()]*25, f"❌ Ошибка: {e}")
+                except Exception as e: return (*[gr.update()]*28, f"❌ Ошибка: {e}")
 
             all_params_list = [
-                enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, d1, d2, s1, s2, scaler, downscale, upscale,
+                enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
+                d1, d2, depth_guard, s1, s2, stop_preview_toggle, stop_preview_steps, scaler, downscale, upscale,
                 smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, keep_unitary_product, align_corners_mode,
                 recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile
             ]
@@ -863,7 +934,7 @@ class KohyaHiresFix(scripts.Script):
 
     def process(
         self, p, enable, simple, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
-        d1, d2, s1, s2, scaler, downscale, upscale,
+        d1, d2, depth_guard, s1, s2, stop_preview_enabled, stop_preview_steps, scaler, downscale, upscale,
         smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
         keep_unitary_product, align_ui, recompute_ui, res_choice, apply_res,
         adapt, adapt_prof, debug_mode_val
@@ -872,6 +943,8 @@ class KohyaHiresFix(scripts.Script):
         self.debug_mode = debug_mode_val
         self.config = DictConfig({
             "algo_mode": algo_mode, "simple_mode": simple, "s1": s1, "s2": s2, "d1": d1, "d2": d2,
+            "depth_guard": depth_guard,
+            "stop_preview_enabled": stop_preview_enabled, "stop_preview_steps": stop_preview_steps,
             "scaler": scaler, "downscale": downscale, "upscale": upscale,
             "smooth_scaling_enh": smooth_scaling_enh, "smooth_scaling_legacy": smooth_scaling_legacy,
             "smoothing_mode": smoothing_mode_select, "smoothing_curve": smoothing_curve, "early_out": early_out,
@@ -899,15 +972,16 @@ class KohyaHiresFix(scripts.Script):
             except: pass
             return
 
-        use_s1, use_s2 = float(s1), float(s2)
+        use_s1, use_s2 = _clamp(float(s1), 0.0, 1.0), _clamp(float(s2), 0.0, 1.0)
         use_d1, use_d2 = int(d1), int(d2)
         use_down, use_up = float(downscale), float(upscale)
+        depth_guard = bool(depth_guard)
 
         if adapt:
             try:
                 use_s1, use_s2, use_d1, use_d2, use_down, use_up = _compute_adaptive_params(
                     int(getattr(p, "width", 1024)), int(getattr(p, "height", 1024)), adapt_prof,
-                    s1, s2, d1, d2, downscale, upscale, keep_unitary_product
+                    use_s1, use_s2, d1, d2, downscale, upscale, keep_unitary_product
                 )
             except: pass
 
@@ -925,8 +999,8 @@ class KohyaHiresFix(scripts.Script):
              print(f"[KohyaHiresFix] Model Error: Invalid blocks (max_inp={max_inp}).")
              return
 
-        d1_idx = max(0, min(int(use_d1) - 1, max_inp))
-        d2_idx = max(0, min(int(use_d2) - 1, max_inp))
+        d1_idx = int(use_d1) - 1
+        d2_idx = int(use_d2) - 1
         scaler_mode = _safe_mode(scaler)
 
         if algo_mode == "Legacy (Original)":
@@ -956,6 +1030,58 @@ class KohyaHiresFix(scripts.Script):
             use_one_enh = bool(only_one_pass_enh)
             use_smooth_legacy = chosen_smoothing
             use_one_legacy = chosen_one_pass
+
+        mapping_notes: list[str] = [
+            f"Доступно входных блоков: {len(inp_list)} | выходных: {len(out_list)}",
+            "Автокоррекция глубины: включена" if depth_guard else "Автокоррекция глубины: выключена",
+        ]
+
+        def _normalize_depth(idx: int, label: str) -> int:
+            clamped = max(0, min(int(idx), max_inp))
+            if clamped != int(idx):
+                mapping_notes.append(
+                    f"{label}: {int(idx) + 1} вне диапазона 1-{max_inp + 1} → использован {clamped + 1}"
+                )
+            return clamped
+
+        if depth_guard:
+            d1_idx = _normalize_depth(d1_idx, "d1")
+            d2_idx = _normalize_depth(d2_idx, "d2")
+            if d2_idx < d1_idx:
+                mapping_notes.append("d1 и d2 упорядочены по возрастанию глубины")
+                d1_idx, d2_idx = d2_idx, d1_idx
+        else:
+            d1_idx = _normalize_depth(d1_idx, "d1")
+            d2_idx = _normalize_depth(d2_idx, "d2")
+
+        # Report the real mapping of user-provided depths to model blocks so it is easier
+        # to diagnose unexpected behavior (e.g. when a chosen depth is clamped).
+        mapped_pairs: list[tuple[int, Optional[int]]] = []
+
+        def _map_with_note(label: str, idx: int) -> Optional[int]:
+            if idx != int(idx):
+                mapping_notes.append(f"{label}: округлено до {idx}")
+            out_idx = KohyaHiresFix._map_output_index(model, idx, early_out)
+            if out_idx is None:
+                mapping_notes.append(f"{label}: выходной блок не найден (input={idx})")
+                return None
+            if idx >= len(inp_list):
+                mapping_notes.append(f"{label}: input {idx + 1} превышает доступные {len(inp_list)} → использован {inp_list and len(inp_list) or 0}")
+            if out_idx >= len(out_list):
+                mapping_notes.append(f"{label}: output {out_idx + 1} превышает доступные {len(out_list)} → использован {out_list and len(out_list) or 0}")
+            mapped_pairs.append((idx, out_idx))
+            return out_idx
+
+        d1_out_idx = _map_with_note("d1", d1_idx)
+        d2_out_idx = _map_with_note("d2", d2_idx)
+        if d1_out_idx is not None and d2_out_idx is not None and d1_out_idx == d2_out_idx:
+            mapping_notes.append(f"d1 и d2 указывают на один и тот же выходной блок ({d1_out_idx + 1})")
+
+        if self.debug_mode:
+            mapping_repr = ", ".join([f"in {i + 1} → out {(o or 0) + 1}" for i, o in mapped_pairs]) or "нет"
+            self.debug_log.append(f"Mapping: {mapping_repr}")
+            for note in mapping_notes:
+                self.debug_log.append(f"⚠️ {note}")
 
         def denoiser_callback(params: script_callbacks.CFGDenoiserParams):
             total = max(1, int(params.total_sampling_steps))
@@ -1057,7 +1183,7 @@ class KohyaHiresFix(scripts.Script):
         self._cb_registered = True
 
         p.extra_generation_params.update({
-            "DSHF_mode": algo_mode, "DSHF_s1": use_s1, "DSHF_s2": use_s2, "DSHF_down": use_down, "DSHF_up": use_up
+            "DSHF_mode": algo_mode, "DSHF_s1": use_s1, "DSHF_s2": use_s2, "DSHF_down": use_down, "DSHF_up": use_up, "DSHF_depth_guard": depth_guard
         })
 
     def postprocess(self, p, processed, *args):
