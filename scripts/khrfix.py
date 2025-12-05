@@ -410,16 +410,22 @@ class KohyaHiresFix(scripts.Script):
         self.step_limit: int = 0
         self.infotext_fields = []
         self._cb_registered: bool = False
-        
+
         # Debug features
         self.debug_mode: bool = False
         self.debug_log: List[str] = []
+        self.debug_log_max_size: int = 100
 
     def title(self) -> str:
         return "Kohya Hires.fix · Unified"
 
     def show(self, is_img2img: bool):
         return scripts.AlwaysVisible
+
+    def _append_debug(self, msg: str) -> None:
+        self.debug_log.append(str(msg))
+        if len(self.debug_log) > self.debug_log_max_size:
+            self.debug_log = self.debug_log[-self.debug_log_max_size :]
 
     @staticmethod
     def _unwrap_all(model) -> None:
@@ -1108,9 +1114,9 @@ class KohyaHiresFix(scripts.Script):
 
         if self.debug_mode:
             mapping_repr = ", ".join([f"in {i + 1} → out {(o or 0) + 1}" for i, o in mapped_pairs]) or "нет"
-            self.debug_log.append(f"Mapping: {mapping_repr}")
+            self._append_debug(f"Mapping: {mapping_repr}")
             for note in mapping_notes:
-                self.debug_log.append(f"⚠️ {note}")
+                self._append_debug(f"⚠️ {note}")
 
         def denoiser_callback(params: script_callbacks.CFGDenoiserParams):
             total = max(1, int(params.total_sampling_steps))
@@ -1122,18 +1128,22 @@ class KohyaHiresFix(scripts.Script):
                     msg = f"Step {current}/{total}: mode={algo_mode}"
                     if algo_mode == "Legacy (Original)" and d1_idx < len(model.input_blocks) and isinstance(model.input_blocks[d1_idx], Scaler):
                          msg += f", d1_scale={model.input_blocks[d1_idx].scale:.3f}"
-                    self.debug_log.append(msg)
+                    self._append_debug(msg)
 
                 # ========================= LEGACY (ORIGINAL) MODE =========================
                 if algo_mode == "Legacy (Original)":
                     if use_one_legacy and self.step_limit: return
 
                     legacy_pairs = [(use_s1, d1_idx), (use_s2, d2_idx)]
+                    combined_legacy: dict[int, float] = {}
+                    for s_stop, d_idx in legacy_pairs:
+                        if s_stop > 0:
+                            combined_legacy[d_idx] = max(combined_legacy.get(d_idx, 0.0), s_stop)
                     n_out = len(model.output_blocks)
 
-                    for s_stop, d_idx in legacy_pairs:
+                    for d_idx, s_stop in combined_legacy.items():
                         if s_stop <= 0: continue
-                        
+
                         # Added explicit validation for legacy loop
                         if d_idx < 0 or d_idx >= len(model.input_blocks): continue
 
@@ -1153,8 +1163,8 @@ class KohyaHiresFix(scripts.Script):
                             return
                         elif isinstance(model.input_blocks[d_idx], Scaler):
                             # Unwrapping with safety checks
+                            model.input_blocks[d_idx] = model.input_blocks[d_idx].block
                             if isinstance(model.output_blocks[out_idx], Scaler):
-                                model.input_blocks[d_idx] = model.input_blocks[d_idx].block
                                 model.output_blocks[out_idx] = model.output_blocks[out_idx].block
 
                     if use_one_legacy and current > 0 and current >= total * max(use_s1, use_s2):
@@ -1176,7 +1186,7 @@ class KohyaHiresFix(scripts.Script):
                             if not isinstance(model.input_blocks[d_i], Scaler):
                                 model.input_blocks[d_i] = Scaler(use_down, model.input_blocks[d_i], scaler_mode, align_mode, recompute_mode)
                                 model.output_blocks[out_i] = Scaler(use_up, model.output_blocks[out_i], scaler_mode, align_mode, recompute_mode)
-                            
+
                             if use_smooth_enh:
                                 ratio = float(max(0.0, min(1.0, current / (total * s_stop))))
                                 if (smoothing_curve or "").lower().startswith("smooth"): ratio = ratio * ratio * (3.0 - 2.0 * ratio)
@@ -1188,9 +1198,9 @@ class KohyaHiresFix(scripts.Script):
                             else:
                                 model.input_blocks[d_i].scale = use_down
                                 model.output_blocks[out_i].scale = use_up
-                        else:
-                            if isinstance(model.input_blocks[d_i], Scaler):
-                                model.input_blocks[d_i] = model.input_blocks[d_i].block
+                        elif isinstance(model.input_blocks[d_i], Scaler):
+                            model.input_blocks[d_i] = model.input_blocks[d_i].block
+                            if isinstance(model.output_blocks[out_i], Scaler):
                                 model.output_blocks[out_i] = model.output_blocks[out_i].block
 
                     if use_one_enh and max_stop > 0 and current >= total * max_stop:
