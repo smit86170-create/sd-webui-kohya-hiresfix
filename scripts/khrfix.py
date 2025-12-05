@@ -918,12 +918,6 @@ class KohyaHiresFix(scripts.Script):
                     "early_out": params[20], "keep_unitary_product": params[21], "align_corners_mode": params[22],
                     "recompute_scale_factor_mode": params[23], "resolution_choice": params[24], "apply_resolution": params[25],
                     "adaptive_by_resolution": params[26], "adaptive_profile": params[27],
-                    "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10], "scaler": params[11],
-                    "downscale": params[12], "upscale": params[13],
-                    "smooth_scaling_enh": params[14], "smooth_scaling_legacy": params[15], "smoothing_mode": params[16], "smoothing_curve": params[17],
-                    "early_out": params[18], "keep_unitary_product": params[19], "align_corners_mode": params[20],
-                    "recompute_scale_factor_mode": params[21], "resolution_choice": params[22], "apply_resolution": params[23],
-                    "adaptive_by_resolution": params[24], "adaptive_profile": params[25],
                 }
                 return json.dumps(config, indent=2, ensure_ascii=False)
 
@@ -950,10 +944,6 @@ class KohyaHiresFix(scripts.Script):
             all_params_list = [
                 enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
                 d1, d2, depth_guard, s1, s2, stop_preview_toggle, stop_preview_steps, scaler, downscale, upscale,
-                except Exception as e: return (*[gr.update()]*26, f"❌ Ошибка: {e}")
-
-            all_params_list = [
-                enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale,
                 smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, keep_unitary_product, align_corners_mode,
                 recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile
             ]
@@ -974,7 +964,6 @@ class KohyaHiresFix(scripts.Script):
     def process(
         self, p, enable, simple, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
         d1, d2, depth_guard, s1, s2, stop_preview_enabled, stop_preview_steps, scaler, downscale, upscale,
-        d1, d2, depth_guard, s1, s2, scaler, downscale, upscale,
         smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
         keep_unitary_product, align_ui, recompute_ui, res_choice, apply_res,
         adapt, adapt_prof, debug_mode_val
