@@ -1,11 +1,11 @@
-# kohya_hires_fix_unified_v2.5.5_final.py
-# Версия: 2.5.5 (Final Polish: Clamp Logic & Size Args)
+# kohya_hires_fix_unified_v2.5.6_final.py
+# Версия: 2.5.6 (Final: Fixed UI Triggers & Preview Logic)
 # Совместимость: A1111 / modules.scripts API, PyTorch >= 1.12
 #
-# ИЗМЕНЕНИЯ v2.5.5:
-# 1. Исправлена логика расчета cur_up (clamp применяется правильно).
-# 2. Scaler: В "New Math" используется size= (точный пиксель), в "Old Math" — scale_factor= (флоат).
-# 3. Полный конфиг и все тултипы на месте.
+# ИЗМЕНЕНИЯ v2.5.6:
+# 1. Исправлена визуализация Stop Preview (обновляется при движении ползунков).
+# 2. Восстановлена логика кнопки "Показать рассчитанные параметры" (Preview Adaptive).
+# 3. Сохранены все математические исправления v2.5.5 (Old Math / Clamp).
 
 from __future__ import annotations
 
@@ -406,7 +406,7 @@ class Scaler(torch.nn.Module):
                 recompute_scale_factor=recompute_scale_factor,
             )
         else:
-            # ✅ NEW (Safe) - size (int) - КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
+            # ✅ NEW (Safe) - size (int)
             h, w = x.shape[-2:]
             new_h = max(1, int(h * self.scale))
             new_w = max(1, int(w * self.scale))
@@ -474,7 +474,7 @@ class KohyaHiresFix(scripts.Script):
         pm = PresetManager()
         cfg = self.config
 
-        # Load defaults (с поддержкой новых флагов)
+        # Load defaults
         last_algo_mode = cfg.get("algo_mode", "Enhanced (RU+)")
         last_resolution_choice = cfg.get("resolution_choice", RESOLUTION_CHOICES[0])
         last_apply_resolution = cfg.get("apply_resolution", False)
@@ -496,11 +496,9 @@ class KohyaHiresFix(scripts.Script):
         last_downscale = _coerce_float(cfg.get("downscale", 0.5), 0.5)
         last_upscale = _coerce_float(cfg.get("upscale", 2.0), 2.0)
         
-        # ФЛАГИ ПО УМОЛЧАНИЮ = True (OLD Logic)
         last_use_old_float_math = cfg.get("use_old_float_math", True) 
         last_use_old_onepass_logic = cfg.get("use_old_onepass_logic", True) 
 
-        # Legacy fallback logic
         legacy_smooth = cfg.get("smooth_scaling", None)
         last_smooth_enh = bool(legacy_smooth) if legacy_smooth is not None else cfg.get("smooth_scaling_enh", True)
         last_smooth_leg = bool(legacy_smooth) if legacy_smooth is not None else cfg.get("smooth_scaling_legacy", True)
@@ -621,6 +619,9 @@ class KohyaHiresFix(scripts.Script):
                         apply_resolution = gr.Checkbox(label="Применить разрешение к width/height", value=last_apply_resolution)
                         adaptive_by_resolution = gr.Checkbox(label="Адаптировать параметры под текущее разрешение", value=last_adaptive_by_resolution)
                         adaptive_profile = gr.Dropdown(choices=["Консервативный", "Сбалансированный", "Агрессивный"], value=last_adaptive_profile, label="Профиль адаптации")
+                        # 🆕 VOIDED PREVIEW BUTTON
+                        btn_preview = gr.Button("Показать рассчитанные параметры", variant="secondary")
+                        preview_md = gr.Markdown("")
 
                 with gr.Group():
                     gr.Markdown("**Интерполяция (Advanced)**")
@@ -678,7 +679,15 @@ class KohyaHiresFix(scripts.Script):
                 return gr.update(choices=pm.names_for_category(cat), value=None)
             preset_category_filter.change(_update_preset_list_for_category, inputs=[preset_category_filter], outputs=[preset_select])
 
-            stop_preview_toggle.change(lambda e,t,s1,s2: (gr.update(visible=e), _format_stop_preview_text(t,s1,s2) if e else ""), inputs=[stop_preview_toggle, stop_preview_steps, s1, s2], outputs=[stop_preview_steps, stop_preview_md])
+            # ✅ ИСПРАВЛЕНО: ТРИГГЕРЫ ДЛЯ STOP PREVIEW
+            def _render_stop_preview(enabled, total_steps, s1_v, s2_v):
+                if not enabled: return gr.update(visible=False, value="")
+                return gr.update(visible=True, value=_format_stop_preview_text(total_steps, s1_v, s2_v))
+
+            stop_preview_toggle.change(_render_stop_preview, inputs=[stop_preview_toggle, stop_preview_steps, s1, s2], outputs=[stop_preview_md])
+            # Триггеры обновления при движении слайдеров
+            for trigger in (stop_preview_steps, s1, s2):
+                trigger.change(_render_stop_preview, inputs=[stop_preview_toggle, stop_preview_steps, s1, s2], outputs=[stop_preview_md])
             
             # --- Quick Presets Logic ---
             def _apply_quick_preset(preset_type: str):
@@ -693,6 +702,18 @@ class KohyaHiresFix(scripts.Script):
             btn_quick_safe.click(lambda: _apply_quick_preset("safe"), outputs=[s1, s2, d1, d2, downscale, upscale])
             btn_quick_balanced.click(lambda: _apply_quick_preset("balanced"), outputs=[s1, s2, d1, d2, downscale, upscale])
             btn_quick_aggressive.click(lambda: _apply_quick_preset("aggressive"), outputs=[s1, s2, d1, d2, downscale, upscale])
+
+            # ✅ ИСПРАВЛЕНО: ЛОГИКА КНОПКИ PREVIEW
+            def _preview_cb(res_v, adapt_v, adapt_prof_v, s1_v, s2_v, d1_v, d2_v, down_v, up_v, keep1_v, mode_v):
+                wh = parse_resolution_label(res_v)
+                w, h = wh if wh else (1024, 1024)
+                if adapt_v:
+                    try: u_s1, u_s2, u_d1, u_d2, u_down, u_up = _compute_adaptive_params(w, h, adapt_prof_v, s1_v, s2_v, d1_v, d2_v, down_v, up_v, keep1_v)
+                    except: u_s1, u_s2, u_d1, u_d2, u_down, u_up = s1_v, s2_v, d1_v, d2_v, down_v, up_v
+                else: u_s1, u_s2, u_d1, u_d2, u_down, u_up = s1_v, s2_v, d1_v, d2_v, down_v, up_v
+                return f"**Mode:** {mode_v}\n**Res:** {w}x{h}\n**S1:** {u_s1:.2f}, **D1:** {u_d1}\n**S2:** {u_s2:.2f}, **D2:** {u_d2}\n**Down:** {u_down:.2f}, **Up:** {u_up:.2f}"
+
+            btn_preview.click(_preview_cb, inputs=[resolution_choice, adaptive_by_resolution, adaptive_profile, s1, s2, d1, d2, downscale, upscale, keep_unitary_product, algo_mode], outputs=[preview_md])
 
             # --- Save/Load Presets ---
             def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, depth_guard_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_sel, sm_c, eo, one_enh, one_leg, one_sel, k1, al, rc, res, app, ad, ad_p, old_math, old_one):
@@ -735,7 +756,7 @@ class KohyaHiresFix(scripts.Script):
             # --- Export/Import Logic ---
             def _export_all_config(*params):
                 config = {
-                    "version": "2.5.5", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
+                    "version": "2.5.6", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
                     "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
                     "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10],
                     "stop_preview_enabled": params[11], "stop_preview_steps": params[12], "scaler": params[13],
