@@ -1,11 +1,10 @@
-# kohya_hires_fix_unified_v2.4.py
-# Версия: 2.4 (Ultimate Edition)
+# kohya_hires_fix_unified_v2.5.1.py
+# Версия: 2.5.1 (Final Polish)
 # Совместимость: A1111 / modules.scripts API, PyTorch >= 1.12
-# Изменения:
-# - Все исправления безопасности v2.3 (NoneType, d1==d2 fix, Model validation)
-# - Добавлено: Quick Presets, Tooltips, Status Indicator, Parameter Validation
-# - Добавлено: Debug Mode, Config Export/Import, Built-in Help
-# - Улучшена валидация индексов в Legacy режиме
+# Изменения v2.5.1:
+# - Все исправления безопасности v2.5 (Bounds check, Depth guard, None-blocks)
+# - Добавлена валидация диапазона downscale
+# - Добавлены поясняющие комментарии к лимитам памяти
 
 from __future__ import annotations
 
@@ -69,8 +68,8 @@ def _atomic_save_yaml(path: Path, data: dict) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
         OmegaConf.save(DictConfig(data), tmp)
         tmp.replace(path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[KohyaHiresFix] Failed to save config: {e}")
 
 
 def _load_presets() -> Dict[str, dict]:
@@ -156,7 +155,8 @@ def _compute_adaptive_params(
 
     down = _clamp(down, 0.1, 1.0)
     if keep_unitary_product:
-        up = 1.0 / max(1e-6, down)
+        # Limit maximum upscale to prevent GPU memory issues (OOM)
+        up = min(10.0, 1.0 / max(0.1, down))
     else:
         up = _clamp(up * (base_down / max(1e-6, down)), 1.0, 4.0)
 
@@ -713,7 +713,7 @@ class KohyaHiresFix(scripts.Script):
                         btn_import_config = gr.Button("📥 Импорт из JSON", variant="secondary")
                     config_json = gr.Textbox(
                         label="JSON конфигурация", lines=3, max_lines=10, 
-                        placeholder='{"version": "2.4", ...}'
+                        placeholder='{"version": "2.5.1", ...}'
                     )
                     import_status = gr.Markdown("")
 
@@ -758,11 +758,16 @@ class KohyaHiresFix(scripts.Script):
 
                 warnings = []
                 if d1_i == d2_i and abs(s1_f - s2_f) > 0.01:
-                    warnings.append("⚠️ **d1 == d2**, но **s1 ≠ s2**: шаги будут объединены с max(s1, s2)")
+                    warnings.append("⚠️ **d1 == d2**: для одного блока будет использован max(s1, s2)")
                 if s1_f > s2_f:
                     warnings.append("⚠️ **s1 > s2**: параметры будут автоматически скорректированы")
                 if s1_f == 0 and s2_f == 0:
                     warnings.append("⚠️ **s1 и s2 равны 0**: эффект не применится")
+                
+                # New: Downscale range validation
+                if down_f <= 0.0 or down_f > 1.0:
+                    warnings.append("⚠️ **downscale** должен быть > 0 и <= 1.0")
+
                 if keep1 and abs(down_f * up_f - 1.0) > 0.1:
                     warnings.append(f"ℹ️ down×up будет скорректирован до 1.0 (сейчас {down_f*up_f:.2f})")
                 return "\n".join(warnings) if warnings else "✅ **Параметры корректны**"
@@ -914,7 +919,7 @@ class KohyaHiresFix(scripts.Script):
             # 9. Export/Import Logic
             def _export_all_config(*params):
                 config = {
-                    "version": "2.4", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
+                    "version": "2.5.1", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
                     "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
                     "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10],
                     "stop_preview_enabled": params[11], "stop_preview_steps": params[12], "scaler": params[13],
@@ -1070,16 +1075,19 @@ class KohyaHiresFix(scripts.Script):
             "Автокоррекция глубины: включена" if depth_guard else "Автокоррекция глубины: выключена",
         ]
 
-        def _normalize_depth(idx: int, label: str, max_depth: int) -> int:
-            clamped = max(0, min(int(idx), max_depth))
+        def _normalize_depth(idx: int, label: str) -> int:
+            clamped = max(0, min(int(idx), max_inp))
             if clamped != int(idx):
                 mapping_notes.append(
-                    f"{label}: {int(idx) + 1} вне диапазона 1-{max_depth + 1} → использован {clamped + 1}"
+                    f"{label}: {int(idx) + 1} вне диапазона 1-{max_inp + 1} → использован {clamped + 1}"
                 )
             return clamped
 
-        d1_idx = _normalize_depth(d1_idx, "d1", max_inp)
-        d2_idx = _normalize_depth(d2_idx, "d2", max_inp)
+        # Normalize depths first (always)
+        d1_idx = _normalize_depth(d1_idx, "d1")
+        d2_idx = _normalize_depth(d2_idx, "d2")
+
+        # Then swap if depth_guard is on
         if depth_guard and d2_idx < d1_idx:
             mapping_notes.append("d1 и d2 упорядочены по возрастанию глубины")
             d1_idx, d2_idx = d2_idx, d1_idx
@@ -1130,35 +1138,26 @@ class KohyaHiresFix(scripts.Script):
                     legacy_pairs = [(use_s1, d1_idx), (use_s2, d2_idx)]
                     combined_legacy: dict[int, float] = {}
                     for s_stop, d_idx in legacy_pairs:
-                        if s_stop <= 0:
-                            continue
-                        if d_idx < 0 or d_idx >= len(model.input_blocks):
-                            mapping_notes.append(
-                                f"Legacy: глубина {d_idx + 1} вне диапазона input-блоков ({len(model.input_blocks)})"
-                            )
-                            continue
-                        combined_legacy[d_idx] = max(combined_legacy.get(d_idx, 0.0), s_stop)
+                        if s_stop > 0:
+                            combined_legacy[d_idx] = max(combined_legacy.get(d_idx, 0.0), s_stop)
                     n_out = len(model.output_blocks)
 
                     for d_idx, s_stop in combined_legacy.items():
                         if s_stop <= 0: continue
 
-                        # Added explicit validation for legacy loop
+                        # Safety checks for bounds and None blocks
                         if d_idx < 0 or d_idx >= len(model.input_blocks): continue
+                        if model.input_blocks[d_idx] is None: continue
 
                         if early_out: out_idx = d_idx
                         else: out_idx = n_out - 1 - d_idx
                         if out_idx < 0 or out_idx >= n_out: continue
-
-                        inp_block = model.input_blocks[d_idx]
-                        out_block = model.output_blocks[out_idx]
-                        if inp_block is None or out_block is None:
-                            continue
+                        if model.output_blocks[out_idx] is None: continue
 
                         if current < total * s_stop:
                             if not isinstance(model.input_blocks[d_idx], Scaler):
-                                model.input_blocks[d_idx] = Scaler(use_down, inp_block, scaler_mode, align_mode, recompute_mode)
-                                model.output_blocks[out_idx] = Scaler(use_up, out_block, scaler_mode, align_mode, recompute_mode)
+                                model.input_blocks[d_idx] = Scaler(use_down, model.input_blocks[d_idx], scaler_mode, align_mode, recompute_mode)
+                                model.output_blocks[out_idx] = Scaler(use_up, model.output_blocks[out_idx], scaler_mode, align_mode, recompute_mode)
                             elif use_smooth_legacy:
                                 scale_ratio = current / (total * s_stop)
                                 cur_down = min((1.0 - use_down) * scale_ratio + use_down, 1.0)
@@ -1183,22 +1182,24 @@ class KohyaHiresFix(scripts.Script):
                     max_stop = max(combined.values()) if combined else 0.0
 
                     for d_i, s_stop in combined.items():
+                        # Safety check: input bounds
                         if d_i < 0 or d_i >= len(model.input_blocks):
                             continue
-
-                        inp_block = model.input_blocks[d_i]
+                        
                         out_i = KohyaHiresFix._map_output_index(model, d_i, early_out)
-                        if out_i is None:
+                        
+                        # Safety check: output bounds
+                        if out_i is None or out_i < 0 or out_i >= len(model.output_blocks):
                             continue
-
-                        out_block = model.output_blocks[out_i] if out_i < len(model.output_blocks) else None
-                        if inp_block is None or out_block is None:
+                        
+                        # Safety check: None blocks
+                        if model.input_blocks[d_i] is None or model.output_blocks[out_i] is None:
                             continue
 
                         if current < total * s_stop:
                             if not isinstance(model.input_blocks[d_i], Scaler):
-                                model.input_blocks[d_i] = Scaler(use_down, inp_block, scaler_mode, align_mode, recompute_mode)
-                                model.output_blocks[out_i] = Scaler(use_up, out_block, scaler_mode, align_mode, recompute_mode)
+                                model.input_blocks[d_i] = Scaler(use_down, model.input_blocks[d_i], scaler_mode, align_mode, recompute_mode)
+                                model.output_blocks[out_i] = Scaler(use_up, model.output_blocks[out_i], scaler_mode, align_mode, recompute_mode)
 
                             if use_smooth_enh:
                                 ratio = float(max(0.0, min(1.0, current / (total * s_stop))))
