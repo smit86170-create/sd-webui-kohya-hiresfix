@@ -758,7 +758,7 @@ class KohyaHiresFix(scripts.Script):
 
                 warnings = []
                 if d1_i == d2_i and abs(s1_f - s2_f) > 0.01:
-                    warnings.append("⚠️ **d1 == d2**, но **s1 ≠ s2**: будет использован max(s1, s2)")
+                    warnings.append("⚠️ **d1 == d2**, но **s1 ≠ s2**: шаги будут объединены с max(s1, s2)")
                 if s1_f > s2_f:
                     warnings.append("⚠️ **s1 > s2**: параметры будут автоматически скорректированы")
                 if s1_f == 0 and s2_f == 0:
@@ -1070,31 +1070,25 @@ class KohyaHiresFix(scripts.Script):
             "Автокоррекция глубины: включена" if depth_guard else "Автокоррекция глубины: выключена",
         ]
 
-        def _normalize_depth(idx: int, label: str) -> int:
-            clamped = max(0, min(int(idx), max_inp))
+        def _normalize_depth(idx: int, label: str, max_depth: int) -> int:
+            clamped = max(0, min(int(idx), max_depth))
             if clamped != int(idx):
                 mapping_notes.append(
-                    f"{label}: {int(idx) + 1} вне диапазона 1-{max_inp + 1} → использован {clamped + 1}"
+                    f"{label}: {int(idx) + 1} вне диапазона 1-{max_depth + 1} → использован {clamped + 1}"
                 )
             return clamped
 
-        if depth_guard:
-            d1_idx = _normalize_depth(d1_idx, "d1")
-            d2_idx = _normalize_depth(d2_idx, "d2")
-            if d2_idx < d1_idx:
-                mapping_notes.append("d1 и d2 упорядочены по возрастанию глубины")
-                d1_idx, d2_idx = d2_idx, d1_idx
-        else:
-            d1_idx = _normalize_depth(d1_idx, "d1")
-            d2_idx = _normalize_depth(d2_idx, "d2")
+        d1_idx = _normalize_depth(d1_idx, "d1", max_inp)
+        d2_idx = _normalize_depth(d2_idx, "d2", max_inp)
+        if depth_guard and d2_idx < d1_idx:
+            mapping_notes.append("d1 и d2 упорядочены по возрастанию глубины")
+            d1_idx, d2_idx = d2_idx, d1_idx
 
         # Report the real mapping of user-provided depths to model blocks so it is easier
         # to diagnose unexpected behavior (e.g. when a chosen depth is clamped).
         mapped_pairs: list[tuple[int, Optional[int]]] = []
 
         def _map_with_note(label: str, idx: int) -> Optional[int]:
-            if idx != int(idx):
-                mapping_notes.append(f"{label}: округлено до {idx}")
             out_idx = KohyaHiresFix._map_output_index(model, idx, early_out)
             if out_idx is None:
                 mapping_notes.append(f"{label}: выходной блок не найден (input={idx})")
@@ -1136,8 +1130,14 @@ class KohyaHiresFix(scripts.Script):
                     legacy_pairs = [(use_s1, d1_idx), (use_s2, d2_idx)]
                     combined_legacy: dict[int, float] = {}
                     for s_stop, d_idx in legacy_pairs:
-                        if s_stop > 0:
-                            combined_legacy[d_idx] = max(combined_legacy.get(d_idx, 0.0), s_stop)
+                        if s_stop <= 0:
+                            continue
+                        if d_idx < 0 or d_idx >= len(model.input_blocks):
+                            mapping_notes.append(
+                                f"Legacy: глубина {d_idx + 1} вне диапазона input-блоков ({len(model.input_blocks)})"
+                            )
+                            continue
+                        combined_legacy[d_idx] = max(combined_legacy.get(d_idx, 0.0), s_stop)
                     n_out = len(model.output_blocks)
 
                     for d_idx, s_stop in combined_legacy.items():
@@ -1150,10 +1150,15 @@ class KohyaHiresFix(scripts.Script):
                         else: out_idx = n_out - 1 - d_idx
                         if out_idx < 0 or out_idx >= n_out: continue
 
+                        inp_block = model.input_blocks[d_idx]
+                        out_block = model.output_blocks[out_idx]
+                        if inp_block is None or out_block is None:
+                            continue
+
                         if current < total * s_stop:
                             if not isinstance(model.input_blocks[d_idx], Scaler):
-                                model.input_blocks[d_idx] = Scaler(use_down, model.input_blocks[d_idx], scaler_mode, align_mode, recompute_mode)
-                                model.output_blocks[out_idx] = Scaler(use_up, model.output_blocks[out_idx], scaler_mode, align_mode, recompute_mode)
+                                model.input_blocks[d_idx] = Scaler(use_down, inp_block, scaler_mode, align_mode, recompute_mode)
+                                model.output_blocks[out_idx] = Scaler(use_up, out_block, scaler_mode, align_mode, recompute_mode)
                             elif use_smooth_legacy:
                                 scale_ratio = current / (total * s_stop)
                                 cur_down = min((1.0 - use_down) * scale_ratio + use_down, 1.0)
@@ -1178,13 +1183,22 @@ class KohyaHiresFix(scripts.Script):
                     max_stop = max(combined.values()) if combined else 0.0
 
                     for d_i, s_stop in combined.items():
+                        if d_i < 0 or d_i >= len(model.input_blocks):
+                            continue
+
+                        inp_block = model.input_blocks[d_i]
                         out_i = KohyaHiresFix._map_output_index(model, d_i, early_out)
-                        if out_i is None: continue
+                        if out_i is None:
+                            continue
+
+                        out_block = model.output_blocks[out_i] if out_i < len(model.output_blocks) else None
+                        if inp_block is None or out_block is None:
+                            continue
 
                         if current < total * s_stop:
                             if not isinstance(model.input_blocks[d_i], Scaler):
-                                model.input_blocks[d_i] = Scaler(use_down, model.input_blocks[d_i], scaler_mode, align_mode, recompute_mode)
-                                model.output_blocks[out_i] = Scaler(use_up, model.output_blocks[out_i], scaler_mode, align_mode, recompute_mode)
+                                model.input_blocks[d_i] = Scaler(use_down, inp_block, scaler_mode, align_mode, recompute_mode)
+                                model.output_blocks[out_i] = Scaler(use_up, out_block, scaler_mode, align_mode, recompute_mode)
 
                             if use_smooth_enh:
                                 ratio = float(max(0.0, min(1.0, current / (total * s_stop))))
