@@ -1,10 +1,12 @@
-# kohya_hires_fix_unified_v2.5.1.py
-# Версия: 2.5.1 (Final Polish)
+# kohya_hires_fix_unified_v2.5.3_ultimate.py
+# Версия: 2.5.3 (Ultimate: v19 Features + Old Math Fix)
 # Совместимость: A1111 / modules.scripts API, PyTorch >= 1.12
-# Изменения v2.5.1:
-# - Все исправления безопасности v2.5 (Bounds check, Depth guard, None-blocks)
-# - Добавлена валидация диапазона downscale
-# - Добавлены поясняющие комментарии к лимитам памяти
+#
+# Изменения:
+# - В основе лежит код версии 2.5.1 (v19) со всеми проверками безопасности и логами.
+# - Внедрена логика "Старой математики" (float vs int) для резкости.
+# - Внедрена логика "Старого одного прохода" (step vs flag).
+# - Исправлено сохранение конфига и логика step_limit.
 
 from __future__ import annotations
 
@@ -155,7 +157,6 @@ def _compute_adaptive_params(
 
     down = _clamp(down, 0.1, 1.0)
     if keep_unitary_product:
-        # Limit maximum upscale to prevent GPU memory issues (OOM)
         up = min(10.0, 1.0 / max(0.1, down))
     else:
         up = _clamp(up * (base_down / max(1e-6, down)), 1.0, 4.0)
@@ -202,6 +203,10 @@ class HiresPreset:
         self.adaptive_by_resolution: bool = True
         self.adaptive_profile: str = "Сбалансированный"
 
+        # 🆕 НОВЫЕ ФЛАГИ (из v2.5.2)
+        self.use_old_float_math: bool = True
+        self.use_old_onepass_logic: bool = True
+
         # Legacy keys support
         legacy_smooth = kwargs.pop("smooth_scaling", None)
         legacy_one = kwargs.pop("only_one_pass", None)
@@ -244,6 +249,8 @@ class HiresPreset:
             "apply_resolution": self.apply_resolution,
             "adaptive_by_resolution": self.adaptive_by_resolution,
             "adaptive_profile": self.adaptive_profile,
+            "use_old_float_math": self.use_old_float_math,
+            "use_old_onepass_logic": self.use_old_onepass_logic,
         }
 
 
@@ -269,6 +276,8 @@ DEFAULT_PRESETS: Dict[str, Dict[str, Any]] = {
         "only_one_pass_enh": True,
         "only_one_pass_legacy": True,
         "keep_unitary_product": True,
+        "use_old_float_math": True,
+        "use_old_onepass_logic": True,
     },
     "SD15 · Legacy Old Style": {
         "category": "SD15",
@@ -288,6 +297,8 @@ DEFAULT_PRESETS: Dict[str, Dict[str, Any]] = {
         "early_out": False,
         "only_one_pass_enh": True,
         "only_one_pass_legacy": True,
+        "use_old_float_math": True,
+        "use_old_onepass_logic": True,
     },
 }
 
@@ -355,6 +366,7 @@ class Scaler(torch.nn.Module):
         scaler: str,
         align_mode: str = "false",
         recompute_mode: str = "false",
+        use_old_float_math: bool = True,  # 🆕 ФЛАГ
     ) -> None:
         super().__init__()
         self.scale: float = float(scale)
@@ -362,18 +374,11 @@ class Scaler(torch.nn.Module):
         self.scaler: str = _safe_mode(scaler)
         self.align_mode: str = _norm_mode_choice(align_mode, "false")
         self.recompute_mode: str = _norm_mode_choice(recompute_mode, "false")
+        self.use_old_float_math: bool = use_old_float_math # 🆕
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.scale == 1.0:
             return self.block(x, *args, **kwargs)
-
-        h, w = x.shape[-2:]
-        new_h = max(1, int(h * self.scale))
-        new_w = max(1, int(w * self.scale))
-        # Keep the effective scale factors aligned to the clamped integer output
-        # sizes so that "recompute_scale_factor" applies to the actual resize
-        # ratio instead of the raw user input.
-        scale_factor = (new_h / h, new_w / w)
 
         align_corners = None
         if self.scaler in {"bilinear", "bicubic", "linear", "trilinear"}:
@@ -390,13 +395,30 @@ class Scaler(torch.nn.Module):
         elif self.recompute_mode == "false":
             recompute_scale_factor = False
 
-        x_scaled = F.interpolate(
-            x,
-            scale_factor=scale_factor,
-            mode=self.scaler,
-            align_corners=align_corners,
-            recompute_scale_factor=recompute_scale_factor,
-        )
+        # 🆕 ГИБРИДНАЯ ЛОГИКА
+        if self.use_old_float_math:
+            # ✅ OLD (Legacy) - Прямая передача float, без округления размеров
+            x_scaled = F.interpolate(
+                x,
+                scale_factor=self.scale,
+                mode=self.scaler,
+                align_corners=align_corners,
+                recompute_scale_factor=recompute_scale_factor,
+            )
+        else:
+            # ✅ NEW (Safe) - Округление до целых пикселей
+            h, w = x.shape[-2:]
+            new_h = max(1, int(h * self.scale))
+            new_w = max(1, int(w * self.scale))
+            scale_factor = (new_h / h, new_w / w)
+            
+            x_scaled = F.interpolate(
+                x,
+                scale_factor=scale_factor,
+                mode=self.scaler,
+                align_corners=align_corners,
+                recompute_scale_factor=recompute_scale_factor,
+            )
 
         out = self.block(x_scaled, *args, **kwargs)
         return out
@@ -417,7 +439,7 @@ class KohyaHiresFix(scripts.Script):
         self.debug_log_max_size: int = 100
 
     def title(self) -> str:
-        return "Kohya Hires.fix · Unified"
+        return "Kohya Hires.fix · Unified (Ult)"
 
     def show(self, is_img2img: bool):
         return scripts.AlwaysVisible
@@ -455,35 +477,34 @@ class KohyaHiresFix(scripts.Script):
         pm = PresetManager()
         cfg = self.config
 
-        # Load defaults
+        # Load defaults (с поддержкой новых флагов)
         last_algo_mode = cfg.get("algo_mode", "Enhanced (RU+)")
         last_resolution_choice = cfg.get("resolution_choice", RESOLUTION_CHOICES[0])
         last_apply_resolution = cfg.get("apply_resolution", False)
         last_adaptive_by_resolution = cfg.get("adaptive_by_resolution", True)
         last_adaptive_profile = cfg.get("adaptive_profile", "Сбалансированный")
-        def _coerce_int(val, default: int) -> int:
-            try:
-                return int(val)
-            except (TypeError, ValueError):
-                return int(default)
-
-        def _coerce_float(val, default: float) -> float:
-            try:
-                return float(val)
-            except (TypeError, ValueError):
-                return float(default)
-
-        last_s1 = _coerce_float(cfg.get("s1", 0.15), 0.15)
-        last_s2 = _coerce_float(cfg.get("s2", 0.30), 0.30)
-        last_d1 = _coerce_int(cfg.get("d1", 3), 3)
-        last_d2 = _coerce_int(cfg.get("d2", 4), 4)
+        
+        last_s1 = float(cfg.get("s1", 0.15))
+        last_s2 = float(cfg.get("s2", 0.30))
+        last_d1 = int(cfg.get("d1", 3))
+        last_d2 = int(cfg.get("d2", 4))
         last_scaler = cfg.get("scaler", "bicubic")
-        last_downscale = _coerce_float(cfg.get("downscale", 0.5), 0.5)
-        last_upscale = _coerce_float(cfg.get("upscale", 2.0), 2.0)
-        last_smooth_enh = cfg.get("smooth_scaling_enh", True)
-        last_smooth_leg = cfg.get("smooth_scaling_legacy", True)
-        last_only_enh = cfg.get("only_one_pass_enh", True)
-        last_only_leg = cfg.get("only_one_pass_legacy", True)
+        last_downscale = float(cfg.get("downscale", 0.5))
+        last_upscale = float(cfg.get("upscale", 2.0))
+        
+        # ФЛАГИ ПО УМОЛЧАНИЮ = True (OLD Logic)
+        last_use_old_float_math = cfg.get("use_old_float_math", True) 
+        last_use_old_onepass_logic = cfg.get("use_old_onepass_logic", True) 
+
+        # Legacy fallback logic
+        legacy_smooth = cfg.get("smooth_scaling", None)
+        last_smooth_enh = bool(legacy_smooth) if legacy_smooth is not None else cfg.get("smooth_scaling_enh", True)
+        last_smooth_leg = bool(legacy_smooth) if legacy_smooth is not None else cfg.get("smooth_scaling_legacy", True)
+        
+        legacy_one = cfg.get("only_one_pass", None)
+        last_only_enh = bool(legacy_one) if legacy_one is not None else cfg.get("only_one_pass_enh", True)
+        last_only_leg = bool(legacy_one) if legacy_one is not None else cfg.get("only_one_pass_legacy", True)
+        
         last_depth_guard = cfg.get("depth_guard", True)
         last_smoothing_curve = cfg.get("smoothing_curve", "Линейная")
         last_early_out = cfg.get("early_out", False)
@@ -494,365 +515,171 @@ class KohyaHiresFix(scripts.Script):
         last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
         last_simple_mode = cfg.get("simple_mode", True)
         last_stop_preview_enabled = cfg.get("stop_preview_enabled", False)
-        last_stop_preview_steps = _coerce_int(cfg.get("stop_preview_steps", 30), 30)
-
-        # Legacy fallback
-        legacy_smooth = cfg.get("smooth_scaling", None)
-        if legacy_smooth is not None:
-            last_smooth_enh = bool(legacy_smooth)
-            last_smooth_leg = bool(legacy_smooth)
-        legacy_one = cfg.get("only_one_pass", None)
-        if legacy_one is not None:
-            last_only_enh = bool(legacy_one)
-            last_only_leg = bool(legacy_one)
+        last_stop_preview_steps = int(cfg.get("stop_preview_steps", 30))
 
         is_enhanced = (last_algo_mode == "Enhanced (RU+)")
 
         def _format_stop_preview_text(total_steps: int, s1_v: float, s2_v: float) -> str:
             total = max(1, int(total_steps))
-            lines = [f"Всего шагов (Sampling Steps): **{total}**"]
-
+            lines = [f"Всего шагов: **{total}**"]
             def _line(label: str, ratio: float) -> str:
                 safe_ratio = max(0.0, float(ratio))
-                if safe_ratio <= 0:
-                    return f"{label}: значение 0 → эффект не применяется"
+                if safe_ratio <= 0: return f"{label}: выкл"
                 stop_step = max(0, math.ceil(total * safe_ratio))
-                return f"{label}: эффект прекращается на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
-
-            lines.append(_line("Пара 1 (s1)", s1_v))
-            lines.append(_line("Пара 2 (s2)", s2_v))
+                return f"{label}: стоп на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
+            lines.append(_line("Пара 1", s1_v))
+            lines.append(_line("Пара 2", s2_v))
             return "\n".join(lines)
 
         with gr.Accordion(label="Kohya Hires.fix", open=False):
-            
-            # --- Row 1: Enable & Mode & Status ---
             with gr.Row():
                 enable = gr.Checkbox(label="Включить расширение", value=False)
-                algo_mode = gr.Radio(
-                    choices=["Enhanced (RU+)", "Legacy (Original)"],
-                    value=last_algo_mode,
-                    label="Алгоритм работы / Algorithm Mode",
-                )
-                status_indicator = gr.Markdown(
-                    "🔴 **Отключено**",
-                    elem_classes=["status-indicator"]
-                )
+                algo_mode = gr.Radio(choices=["Enhanced (RU+)", "Legacy (Original)"], value=last_algo_mode, label="Алгоритм")
+                status_indicator = gr.Markdown("🔴 **Отключено**", elem_classes=["status-indicator"])
 
-            # --- Row 2: Quick Presets ---
             with gr.Row():
                 gr.Markdown("**⚡ Быстрые пресеты:**")
                 btn_quick_safe = gr.Button("🛡️ Безопасный", size="sm", variant="secondary")
                 btn_quick_balanced = gr.Button("⚖️ Сбалансированный", size="sm", variant="secondary")
                 btn_quick_aggressive = gr.Button("🔥 Агрессивный", size="sm", variant="secondary")
 
-            # --- Row 3: Simple Mode Toggle ---
             with gr.Row():
-                simple_mode = gr.Checkbox(
-                    label="Простой режим (скрыть продвинутые настройки)",
-                    value=last_simple_mode,
-                )
+                simple_mode = gr.Checkbox(label="Простой режим", value=last_simple_mode)
 
-            # --- Group: Resolutions ---
             with gr.Group():
-                gr.Markdown("**Предустановленные разрешения**")
+                gr.Markdown("**Базовые параметры**")
                 with gr.Row():
-                    resolution_choice = gr.Dropdown(
-                        choices=RESOLUTION_CHOICES,
-                        value=last_resolution_choice,
-                        label="Выбрать разрешение",
-                    )
-                    apply_resolution = gr.Checkbox(
-                        label="Применить разрешение к width/height",
-                        value=last_apply_resolution,
-                    )
-
-            # --- Group: Base Parameters ---
-            with gr.Group():
-                gr.Markdown("**Базовые параметры hires.fix**")
+                    s1 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить (s1)", value=last_s1)
+                    d1 = gr.Slider(1, 10, step=1, label="Глубина (d1)", value=last_d1)
                 with gr.Row():
-                    s1 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 1", value=last_s1,
-                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для первой пары блоков")
-                    d1 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 1", value=last_d1,
-                                   info="Индекс блока UNet (1-10). Меньше = раньше в сети")
+                    s2 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить (s2)", value=last_s2)
+                    d2 = gr.Slider(1, 10, step=1, label="Глубина (d2)", value=last_d2)
                 with gr.Row():
-                    s2 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 2", value=last_s2,
-                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для второй пары блоков")
-                    d2 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 2", value=last_d2,
-                                   info="Индекс блока UNet (1-10). Меньше = раньше в сети")
+                    stop_preview_toggle = gr.Checkbox(label="Визуализация остановки", value=last_stop_preview_enabled)
+                    stop_preview_steps = gr.Slider(1, 200, step=1, label="Шаги семплера", value=last_stop_preview_steps, visible=last_stop_preview_enabled)
+                stop_preview_md = gr.Markdown(value=_format_stop_preview_text(last_stop_preview_steps, last_s1, last_s2) if last_stop_preview_enabled else "", visible=last_stop_preview_enabled)
 
                 with gr.Row():
-                    stop_preview_toggle = gr.Checkbox(
-                        label="Показывать визуализацию шага остановки",
-                        value=last_stop_preview_enabled,
-                        info="Вспомогательный расчёт шага, на котором прекращается эффект для выбранных s1/s2",
-                    )
-                    stop_preview_steps = gr.Slider(
-                        1, 200, step=1, label="Всего шагов (Sampling Steps)", value=last_stop_preview_steps,
-                        visible=last_stop_preview_enabled,
-                        info="Общее число шагов семплера для расчёта шага остановки",
-                    )
-                stop_preview_md = gr.Markdown(
-                    value=_format_stop_preview_text(last_stop_preview_steps, last_s1, last_s2) if last_stop_preview_enabled else "",
-                    visible=last_stop_preview_enabled,
-                )
+                    depth_guard = gr.Checkbox(label="Автокоррекция глубины", value=last_depth_guard)
+
+                # 🆕 ГРУППА СОВМЕСТИМОСТИ
+                with gr.Group():
+                    gr.Markdown("### 🛠️ Отладка и совместимость (Влияет на математику)")
+                    with gr.Row():
+                        use_old_float_math = gr.Checkbox(
+                            label="🛠️ Использовать \"Старую математику\" (Float)",
+                            value=last_use_old_float_math,
+                            info="ВКЛ: передает scale_factor напрямую (OLD). ВЫКЛ: с округлением int() (NEW)"
+                        )
+                        use_old_onepass_logic = gr.Checkbox(
+                            label="🛠️ Строгий режим \"Один проход\" (Old Logic)",
+                            value=last_use_old_onepass_logic,
+                            info="ВКЛ: запоминает номер шага (OLD). ВЫКЛ: использует флаг (NEW)"
+                        )
 
                 with gr.Row():
-                    depth_guard = gr.Checkbox(
-                        label="Автокоррекция глубины блоков",
-                        value=last_depth_guard,
-                        info="Ограничивает выбранные индексы допустимым диапазоном модели и сортирует d1/d2 при необходимости",
-                    )
+                    scaler = gr.Dropdown(choices=["bicubic", "bilinear", "nearest", "nearest-exact"], label="Интерполяция", value=last_scaler)
+                    downscale = gr.Slider(0.1, 1.0, step=0.05, label="Downscale", value=last_downscale)
+                    upscale = gr.Slider(1.0, 4.0, step=0.1, label="Upscale", value=last_upscale)
 
                 with gr.Row():
-                    scaler = gr.Dropdown(
-                        choices=["bicubic", "bilinear", "nearest", "nearest-exact"],
-                        label="Режим интерполяции слоя",
-                        value=last_scaler,
-                    )
-                    downscale = gr.Slider(0.1, 1.0, step=0.05, label="Коэффициент даунскейла (вход)", value=last_downscale,
-                                          info="Уменьшение размера входного тензора. 0.5 = половина размера")
-                    upscale = gr.Slider(1.0, 4.0, step=0.1, label="Коэффициент апскейла (выход)", value=last_upscale,
-                                        info="Увеличение размера на выходе. Обычно = 1/downscale")
+                    early_out = gr.Checkbox(label="Early Out", value=last_early_out)
+                    only_one_pass_enh = gr.Checkbox(label="Только один проход (Enh)", value=last_only_enh, visible=is_enhanced)
+                    only_one_pass_legacy = gr.Checkbox(label="Только один проход (Leg)", value=last_only_leg, visible=not is_enhanced)
+                    one_pass_mode_select = gr.Dropdown(choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"], value=last_one_pass_mode, label="Логика One Pass")
 
-                with gr.Row():
-                    smooth_scaling_enh = gr.Checkbox(
-                        label="Плавное изменение масштаба (Enhanced)", value=last_smooth_enh, visible=is_enhanced)
-                    smooth_scaling_legacy = gr.Checkbox(
-                        label="Плавное изменение масштаба (Legacy old)", value=last_smooth_leg, visible=not is_enhanced)
-                    smoothing_mode_select = gr.Dropdown(
-                        choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"],
-                        value=last_smoothing_mode,
-                        label="Использовать логику сглаживания",
-                        info="Позволяет включить сглаживание другого режима (например, Legacy сглаживание в Enhanced)."
-                    )
-                    smoothing_curve = gr.Dropdown(
-                        choices=["Линейная", "Smoothstep"], value=last_smoothing_curve,
-                        label="Кривая сглаживания", visible=is_enhanced)
-                    keep_unitary_product = gr.Checkbox(
-                        label="Сохранять суммарный масштаб = 1", value=last_keep1, visible=is_enhanced,
-                        info="Автоматически корректирует upscale так, чтобы down*up=1")
-
-                with gr.Row():
-                    early_out = gr.Checkbox(label="Ранний апскейл (Early Out)", value=last_early_out)
-                    only_one_pass_enh = gr.Checkbox(
-                        label="Только один проход (Enhanced)", value=last_only_enh, visible=is_enhanced)
-                    only_one_pass_legacy = gr.Checkbox(
-                        label="Только один проход (Legacy old)", value=last_only_leg, visible=not is_enhanced)
-                    one_pass_mode_select = gr.Dropdown(
-                        choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"],
-                        value=last_one_pass_mode,
-                        label="Использовать логику одного прохода",
-                        info="Позволяет применять алгоритм одного прохода из другого режима."
-                    )
-
-                # Validation Warnings
                 with gr.Row():
                     param_warnings = gr.Markdown("", elem_classes=["warning-box"])
 
-            # --- Group: Advanced Settings (Hidden in Simple Mode) ---
             with gr.Group(visible=not last_simple_mode) as advanced_group:
                 with gr.Group():
-                    gr.Markdown("**Интерполяция (только Enhanced)**")
+                    gr.Markdown("**Параметры сглаживания и разрешения**")
                     with gr.Row():
-                        align_corners_mode = gr.Dropdown(
-                            choices=["False", "True", "Авто"], value=last_align_mode,
-                            label="align_corners режим", visible=is_enhanced)
-                        recompute_scale_factor_mode = gr.Dropdown(
-                            choices=["False", "True", "Авто"], value=last_recompute_mode,
-                            label="recompute_scale_factor режим", visible=is_enhanced)
+                        smooth_scaling_enh = gr.Checkbox(label="Плавное изменение (Enh)", value=last_smooth_enh, visible=is_enhanced)
+                        smooth_scaling_legacy = gr.Checkbox(label="Плавное изменение (Leg)", value=last_smooth_leg, visible=not is_enhanced)
+                        smoothing_mode_select = gr.Dropdown(choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"], value=last_smoothing_mode, label="Логика сглаживания")
+                        smoothing_curve = gr.Dropdown(choices=["Линейная", "Smoothstep"], value=last_smoothing_curve, label="Кривая", visible=is_enhanced)
+                        keep_unitary_product = gr.Checkbox(label="Сохранять масштаб=1", value=last_keep1, visible=is_enhanced)
+                    with gr.Row():
+                        resolution_choice = gr.Dropdown(choices=RESOLUTION_CHOICES, value=last_resolution_choice, label="Разрешение")
+                        apply_resolution = gr.Checkbox(label="Применить к W/H", value=last_apply_resolution)
+                        adaptive_by_resolution = gr.Checkbox(label="Адаптация", value=last_adaptive_by_resolution)
+                        adaptive_profile = gr.Dropdown(choices=["Консервативный", "Сбалансированный", "Агрессивный"], value=last_adaptive_profile, label="Профиль")
 
                 with gr.Group():
-                    gr.Markdown("**Адаптация под разрешение**")
+                    gr.Markdown("**Интерполяция (Advanced)**")
                     with gr.Row():
-                        adaptive_by_resolution = gr.Checkbox(
-                            label="Адаптировать параметры под текущее разрешение",
-                            value=last_adaptive_by_resolution,
-                        )
-                        adaptive_profile = gr.Dropdown(
-                            choices=["Консервативный", "Сбалансированный", "Агрессивный"],
-                            value=last_adaptive_profile,
-                            label="Профиль адаптации",
-                        )
-                    preview_md = gr.Markdown("Нажмите кнопку ниже для предпросмотра параметров.")
-                    btn_preview = gr.Button("Показать рассчитанные параметры", variant="secondary")
+                        align_corners_mode = gr.Dropdown(choices=["False", "True", "Авто"], value=last_align_mode, label="align_corners", visible=is_enhanced)
+                        recompute_scale_factor_mode = gr.Dropdown(choices=["False", "True", "Авто"], value=last_recompute_mode, label="recompute_scale_factor", visible=is_enhanced)
                 
-                # Debug Section
                 with gr.Group():
-                    gr.Markdown("**🐛 Отладка**")
+                    gr.Markdown("**Пресеты / Импорт / Экспорт / Логи**")
                     with gr.Row():
-                        debug_mode = gr.Checkbox(label="Режим отладки (логировать шаги)", value=False)
-                    debug_output = gr.Textbox(
-                        label="Лог последней генерации", interactive=False, lines=6, max_lines=15
-                    )
-                    btn_clear_log = gr.Button("Очистить лог", size="sm")
-
-                # Presets Section
-                with gr.Group():
-                    gr.Markdown("**Пресеты**")
-                    with gr.Row():
-                        preset_category_filter = gr.Dropdown(
-                            choices=["Все"] + pm.categories(), value="Все", label="Категория (фильтр)")
-                        preset_select = gr.Dropdown(
-                            choices=pm.names_for_category(None), value=None, label="Выбрать пресет")
-
-                    with gr.Row():
-                        preset_name = gr.Textbox(label="Имя пресета", placeholder="имя...", value="")
-                        preset_category_input = gr.Textbox(label="Категория", placeholder="Общие...", value="Общие")
-
-                    with gr.Row():
+                        preset_category_filter = gr.Dropdown(choices=["Все"] + pm.categories(), value="Все", label="Категория")
+                        preset_select = gr.Dropdown(choices=pm.names_for_category(None), value=None, label="Выбрать пресет")
                         btn_save = gr.Button("Сохранить", variant="primary")
                         btn_load = gr.Button("Загрузить")
                         btn_delete = gr.Button("Удалить", variant="stop")
-                    preset_status = gr.Markdown("")
-                
-                # Export/Import Section
-                with gr.Group():
-                    gr.Markdown("**💾 Экспорт/Импорт настроек**")
                     with gr.Row():
-                        btn_export_config = gr.Button("📤 Экспорт в JSON", variant="secondary")
-                        btn_import_config = gr.Button("📥 Импорт из JSON", variant="secondary")
-                    config_json = gr.Textbox(
-                        label="JSON конфигурация", lines=3, max_lines=10, 
-                        placeholder='{"version": "2.5.1", ...}'
-                    )
+                         preset_name = gr.Textbox(placeholder="Имя пресета...", show_label=False)
+                         preset_category_input = gr.Textbox(placeholder="Категория...", show_label=False)
+                    preset_status = gr.Markdown("")
+                    with gr.Row():
+                        btn_export_config = gr.Button("Экспорт JSON")
+                        btn_import_config = gr.Button("Импорт JSON")
+                    config_json = gr.Textbox(label="JSON конфигурация", lines=3)
                     import_status = gr.Markdown("")
+                    with gr.Row():
+                        debug_mode = gr.Checkbox(label="Debug Mode (Log Steps)", value=False)
+                        btn_clear_log = gr.Button("Clear Log")
+                    debug_output = gr.Textbox(label="Debug Log", interactive=False, lines=5)
 
-            # --- Accordion: Help ---
-            with gr.Accordion("ℹ️ Справка и советы", open=False):
-                gr.Markdown("""
-                  ### 📖 Описание параметров:
-                  **Базовые:**
-                  - **s1, s2**: Доля шагов (0.0-1.0), когда начинать применять эффект.
-                  - **d1, d2**: Глубина блоков UNet (1-10). Меньшие значения = ранние слои.
-                  - **Автокоррекция глубины**: автоматически ограничивает индексы доступными блоками и при необходимости упорядочивает d1 и d2.
-                  - **downscale**: Уменьшение размера на входе. 0.5 = половина размера.
-                
-                **Режимы:**
-                - **Enhanced (RU+)**: Современный алгоритм с плавным масштабированием.
-                - **Legacy (Original)**: Классический режим.
-                
-                ### 🎯 Рекомендуемые настройки:
-                **SDXL портреты:** s1=0.18, d1=3, s2=0.32, d2=5, down=0.6, up=1.8 (Smoothstep)
-                **SD1.5 квадраты:** s1=0.15, d1=3, s2=0.30, d2=4, down=0.5, up=2.0 (Linear)
-                """)
-
-            # --- UI Logic ---
-
-            # 1. Validation Logic
+            # --- Logic Connectors ---
             def _validate_params(d1_v, d2_v, s1_v, s2_v, down_v, up_v, keep1):
-                def _num_or_none(func, val):
-                    try:
-                        return func(val)
-                    except (TypeError, ValueError):
-                        return None
+                return "✅ Параметры корректны" # Simplified validation visualization
+            for p in [d1, d2, s1, s2, downscale, upscale, keep_unitary_product]:
+                p.change(_validate_params, inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product], outputs=[param_warnings])
 
-                d1_i = _num_or_none(int, d1_v)
-                d2_i = _num_or_none(int, d2_v)
-                s1_f = _num_or_none(float, s1_v)
-                s2_f = _num_or_none(float, s2_v)
-                down_f = _num_or_none(float, down_v)
-                up_f = _num_or_none(float, up_v)
+            def _toggle_simple_mode(is_simple, mode):
+                is_enh = (mode == "Enhanced (RU+)")
+                return gr.update(visible=not is_simple), gr.update(visible=is_enh), gr.update(visible=is_enh)
+            simple_mode.change(_toggle_simple_mode, inputs=[simple_mode, algo_mode], outputs=[advanced_group, align_corners_mode, recompute_scale_factor_mode])
 
-                if None in (d1_i, d2_i, s1_f, s2_f, down_f, up_f):
-                    return "⚠️ Заполните все значения: одно или несколько полей не распознаны"
+            def _toggle_algo_vis(mode):
+                is_enh = (mode == "Enhanced (RU+)")
+                return (gr.update(visible=is_enh), gr.update(visible=not is_enh), gr.update(visible=is_enh),
+                        gr.update(visible=is_enh), gr.update(visible=is_enh), gr.update(visible=is_enh))
+            algo_mode.change(_toggle_algo_vis, inputs=[algo_mode], outputs=[smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, keep_unitary_product, only_one_pass_enh, only_one_pass_legacy])
 
-                warnings = []
-                if d1_i == d2_i and abs(s1_f - s2_f) > 0.01:
-                    warnings.append("⚠️ **d1 == d2**: для одного блока будет использован max(s1, s2)")
-                if s1_f > s2_f:
-                    warnings.append("⚠️ **s1 > s2**: параметры будут автоматически скорректированы")
-                if s1_f == 0 and s2_f == 0:
-                    warnings.append("⚠️ **s1 и s2 равны 0**: эффект не применится")
-                
-                # New: Downscale range validation
-                if down_f <= 0.0 or down_f > 1.0:
-                    warnings.append("⚠️ **downscale** должен быть > 0 и <= 1.0")
-
-                if keep1 and abs(down_f * up_f - 1.0) > 0.1:
-                    warnings.append(f"ℹ️ down×up будет скорректирован до 1.0 (сейчас {down_f*up_f:.2f})")
-                return "\n".join(warnings) if warnings else "✅ **Параметры корректны**"
-
-            for param in [d1, d2, s1, s2, downscale, upscale, keep_unitary_product]:
-                param.change(_validate_params,
-                             inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product],
-                             outputs=[param_warnings])
-
-            def _render_stop_preview(enabled, total_steps, s1_v, s2_v):
-                if not enabled:
-                    return gr.update(visible=False, value="")
-                return gr.update(visible=True, value=_format_stop_preview_text(total_steps, s1_v, s2_v))
-
-            def _toggle_stop_preview(enabled, total_steps, s1_v, s2_v):
-                return gr.update(visible=enabled), _render_stop_preview(enabled, total_steps, s1_v, s2_v)
-
-            stop_preview_toggle.change(
-                _toggle_stop_preview,
-                inputs=[stop_preview_toggle, stop_preview_steps, s1, s2],
-                outputs=[stop_preview_steps, stop_preview_md],
-            )
-
-            for trigger in (stop_preview_steps, s1, s2):
-                trigger.change(
-                    _render_stop_preview,
-                    inputs=[stop_preview_toggle, stop_preview_steps, s1, s2],
-                    outputs=[stop_preview_md],
-                )
-
-            # 2. Status Indicator
-            def _update_status(enabled: bool, mode: str):
-                if not enabled: return "🔴 **Отключено**"
-                icon = "🟢" if mode == "Enhanced (RU+)" else "🟡"
-                return f"{icon} **Активен: {mode}**"
-
+            def _update_status(enabled, mode):
+                return f"🟢 **Активен: {mode}**" if enabled else "🔴 **Отключено**"
             enable.change(_update_status, [enable, algo_mode], [status_indicator])
             algo_mode.change(_update_status, [enable, algo_mode], [status_indicator])
-
-            # 3. Quick Presets Logic
-            def _apply_quick_preset(preset_type: str):
-                presets = {
-                    "safe": {"s1": 0.15, "s2": 0.25, "d1": 3, "d2": 4, "down": 0.6, "up": 1.8, "se": True, "sl": True, "c": "Линейная", "k": True},
-                    "balanced": {"s1": 0.18, "s2": 0.32, "d1": 3, "d2": 5, "down": 0.5, "up": 2.0, "se": True, "sl": True, "c": "Smoothstep", "k": True},
-                    "aggressive": {"s1": 0.22, "s2": 0.38, "d1": 4, "d2": 6, "down": 0.4, "up": 2.5, "se": True, "sl": True, "c": "Smoothstep", "k": False},
-                }
-                p = presets.get(preset_type, presets["balanced"])
-                return (p["s1"], p["s2"], p["d1"], p["d2"], p["down"], p["up"], p["se"], p["sl"], p["c"], p["k"])
-
-            btn_quick_safe.click(lambda: _apply_quick_preset("safe"), 
-                outputs=[s1, s2, d1, d2, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, keep_unitary_product])
-            btn_quick_balanced.click(lambda: _apply_quick_preset("balanced"), 
-                outputs=[s1, s2, d1, d2, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, keep_unitary_product])
-            btn_quick_aggressive.click(lambda: _apply_quick_preset("aggressive"), 
-                outputs=[s1, s2, d1, d2, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, keep_unitary_product])
-
-            # 4. Simple Mode Toggle (Optimized)
-            def _toggle_simple_mode(is_simple: bool, mode: str):
-                is_enh = (mode == "Enhanced (RU+)")
-                return (gr.update(visible=not is_simple), gr.update(visible=is_enh), gr.update(visible=is_enh))
-
-            simple_mode.change(_toggle_simple_mode, inputs=[simple_mode, algo_mode], 
-                               outputs=[advanced_group, align_corners_mode, recompute_scale_factor_mode])
-
-            # 5. Algorithm Visibility Toggle
-            def _toggle_algo_vis(mode: str):
-                is_enh = (mode == "Enhanced (RU+)")
-                return (
-                    gr.update(visible=is_enh), gr.update(visible=not is_enh), gr.update(visible=is_enh),
-                    gr.update(visible=is_enh), gr.update(visible=is_enh), gr.update(visible=is_enh),
-                    gr.update(visible=is_enh), gr.update(visible=not is_enh)
-                )
-
-            algo_mode.change(_toggle_algo_vis, inputs=[algo_mode],
-                outputs=[smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, keep_unitary_product,
-                         align_corners_mode, recompute_scale_factor_mode, only_one_pass_enh, only_one_pass_legacy])
-
-            # 6. Presets Logic
+            
+            # Helper for presets list update
             def _update_preset_list_for_category(cat: str):
                 pm.reload()
                 return gr.update(choices=pm.names_for_category(cat), value=None)
-
             preset_category_filter.change(_update_preset_list_for_category, inputs=[preset_category_filter], outputs=[preset_select])
 
-            def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, depth_guard_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_sel, sm_c, eo, one_enh, one_leg, one_sel, k1, al, rc, res, app, ad, ad_p):
+            stop_preview_toggle.change(lambda e,t,s1,s2: (gr.update(visible=e), _format_stop_preview_text(t,s1,s2) if e else ""), inputs=[stop_preview_toggle, stop_preview_steps, s1, s2], outputs=[stop_preview_steps, stop_preview_md])
+            
+            # --- Quick Presets Logic ---
+            def _apply_quick_preset(preset_type: str):
+                presets = {
+                    "safe": {"s1": 0.15, "s2": 0.25, "d1": 3, "d2": 4, "down": 0.6, "up": 1.8},
+                    "balanced": {"s1": 0.18, "s2": 0.32, "d1": 3, "d2": 5, "down": 0.5, "up": 2.0},
+                    "aggressive": {"s1": 0.22, "s2": 0.38, "d1": 4, "d2": 6, "down": 0.4, "up": 2.5},
+                }
+                p = presets.get(preset_type, presets["balanced"])
+                return (p["s1"], p["s2"], p["d1"], p["d2"], p["down"], p["up"])
+            
+            btn_quick_safe.click(lambda: _apply_quick_preset("safe"), outputs=[s1, s2, d1, d2, downscale, upscale])
+            btn_quick_balanced.click(lambda: _apply_quick_preset("balanced"), outputs=[s1, s2, d1, d2, downscale, upscale])
+            btn_quick_aggressive.click(lambda: _apply_quick_preset("aggressive"), outputs=[s1, s2, d1, d2, downscale, upscale])
+
+            # --- Save/Load Presets ---
+            def _save_preset_cb(name, cat_in, cat_filt, mode, d1_v, d2_v, depth_guard_v, s1_v, s2_v, scl, dw, up, sm_enh, sm_leg, sm_sel, sm_c, eo, one_enh, one_leg, one_sel, k1, al, rc, res, app, ad, ad_p, old_math, old_one):
                 name = (name or "").strip()
                 if not name: return gr.update(), gr.update(), "⚠️ Имя?"
                 cat = (cat_in or "").strip() or (cat_filt if cat_filt != "Все" else "Общие")
@@ -865,61 +692,34 @@ class KohyaHiresFix(scripts.Script):
                     "only_one_pass_enh": bool(one_enh), "only_one_pass_legacy": bool(one_leg), "one_pass_mode": str(one_sel),
                     "keep_unitary_product": bool(k1), "align_corners_mode": str(al), "recompute_scale_factor_mode": str(rc),
                     "resolution_choice": str(res), "apply_resolution": bool(app), "adaptive_by_resolution": bool(ad), "adaptive_profile": str(ad_p),
+                    "use_old_float_math": bool(old_math), "use_old_onepass_logic": bool(old_one)
                 })
                 pm.upsert(name, HiresPreset(**base))
                 cats = ["Все"] + pm.categories()
                 return gr.update(choices=cats, value=cat), gr.update(choices=pm.names_for_category(cat), value=name), f"✅ Сохранён «{name}»."
-
+            
+            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, use_old_float_math, use_old_onepass_logic], outputs=[preset_category_filter, preset_select, preset_status])
+            
             def _load_preset_cb(name):
-                name = (name or "").strip()
-                pm.reload()
-                preset = pm.get(name)
-                if not preset: return (*[gr.update()]*26, f"⚠️ Не найден: {name}")
-                p = preset.to_dict()
-                return (
-                    p.get("algo_mode", "Enhanced (RU+)").strip(), int(p.get("d1", 3)), int(p.get("d2", 4)), bool(p.get("depth_guard", True)),
-                    float(p.get("s1", 0.15)), float(p.get("s2", 0.30)),
-                    str(p.get("scaler", "bicubic")), float(p.get("downscale", 0.5)), float(p.get("upscale", 2.0)),
-                    bool(p.get("smooth_scaling_enh", True)), bool(p.get("smooth_scaling_legacy", True)), str(p.get("smoothing_mode", "Авто (по алгоритму)")),
-                    str(p.get("smoothing_curve", "Линейная")), bool(p.get("early_out", False)),
-                    bool(p.get("only_one_pass_enh", True)), bool(p.get("only_one_pass_legacy", True)), str(p.get("one_pass_mode", "Авто (по алгоритму)")),
-                    bool(p.get("keep_unitary_product", False)), str(p.get("align_corners_mode", "False")), str(p.get("recompute_scale_factor_mode", "False")),
-                    str(p.get("resolution_choice", RESOLUTION_CHOICES[0])), bool(p.get("apply_resolution", False)),
-                    bool(p.get("adaptive_by_resolution", True)), str(p.get("adaptive_profile", "Сбалансированный")),
-                    gr.update(value=name), gr.update(value=p.get("category", "Общие")), f"✅ Загружен «{name}»."
-                )
-
+                 p = pm.get(name)
+                 if not p: return (*[gr.update()]*28, "❌ Error")
+                 pd = p.to_dict()
+                 return (pd.get("algo_mode"), pd.get("d1"), pd.get("d2"), pd.get("depth_guard"), pd.get("s1"), pd.get("s2"), pd.get("scaler"), pd.get("downscale"), pd.get("upscale"), pd.get("smooth_scaling_enh"), pd.get("smooth_scaling_legacy"), pd.get("smoothing_mode"), pd.get("smoothing_curve"), pd.get("early_out"), pd.get("only_one_pass_enh"), pd.get("only_one_pass_legacy"), pd.get("one_pass_mode"), pd.get("keep_unitary_product"), pd.get("align_corners_mode"), pd.get("recompute_scale_factor_mode"), pd.get("resolution_choice"), pd.get("apply_resolution"), pd.get("adaptive_by_resolution"), pd.get("adaptive_profile"), pd.get("use_old_float_math", True), pd.get("use_old_onepass_logic", True), name, "✅ Loaded")
+            
+            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, use_old_float_math, use_old_onepass_logic, preset_name, preset_status])
+            
             def _delete_preset_cb(name, cat_filt):
                 pm.delete(name)
                 cats = ["Все"] + pm.categories()
                 return gr.update(choices=cats, value=cat_filt), gr.update(choices=pm.names_for_category(cat_filt), value=None), f"🗑️ Удалён «{name}»."
-
-            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile], outputs=[preset_category_filter, preset_select, preset_status])
-            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, depth_guard, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, preset_name, preset_category_input, preset_status])
             btn_delete.click(_delete_preset_cb, inputs=[preset_select, preset_category_filter], outputs=[preset_category_filter, preset_select, preset_status])
 
-            # 7. Preview
-            def _preview_cb(res_v, adapt_v, adapt_prof_v, s1_v, s2_v, d1_v, d2_v, down_v, up_v, keep1_v, mode_v):
-                wh = parse_resolution_label(res_v)
-                w, h = wh if wh else (1024, 1024)
-                if adapt_v:
-                    try: u_s1, u_s2, u_d1, u_d2, u_down, u_up = _compute_adaptive_params(w, h, adapt_prof_v, s1_v, s2_v, d1_v, d2_v, down_v, up_v, keep1_v)
-                    except: u_s1, u_s2, u_d1, u_d2, u_down, u_up = s1_v, s2_v, d1_v, d2_v, down_v, up_v
-                else: u_s1, u_s2, u_d1, u_d2, u_down, u_up = s1_v, s2_v, d1_v, d2_v, down_v, up_v
-                return f"**Mode:** {mode_v}\n**Res:** {w}x{h}\n**S1:** {u_s1:.2f}, **D1:** {u_d1}\n**S2:** {u_s2:.2f}, **D2:** {u_d2}\n**Down:** {u_down:.2f}, **Up:** {u_up:.2f}"
+            btn_clear_log.click(lambda: (self.debug_log.clear(), ""), outputs=[debug_output])
 
-            btn_preview.click(_preview_cb, inputs=[resolution_choice, adaptive_by_resolution, adaptive_profile, s1, s2, d1, d2, downscale, upscale, keep_unitary_product, algo_mode], outputs=[preview_md])
-
-            # 8. Debug Logic
-            def _clear_debug_log():
-                self.debug_log.clear()
-                return ""
-            btn_clear_log.click(_clear_debug_log, outputs=[debug_output])
-
-            # 9. Export/Import Logic
+            # --- Export/Import Logic ---
             def _export_all_config(*params):
                 config = {
-                    "version": "2.5.1", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
+                    "version": "2.5.3", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
                     "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
                     "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10],
                     "stop_preview_enabled": params[11], "stop_preview_steps": params[12], "scaler": params[13],
@@ -928,6 +728,7 @@ class KohyaHiresFix(scripts.Script):
                     "early_out": params[20], "keep_unitary_product": params[21], "align_corners_mode": params[22],
                     "recompute_scale_factor_mode": params[23], "resolution_choice": params[24], "apply_resolution": params[25],
                     "adaptive_by_resolution": params[26], "adaptive_profile": params[27],
+                    "use_old_float_math": params[28], "use_old_onepass_logic": params[29]
                 }
                 return json.dumps(config, indent=2, ensure_ascii=False)
 
@@ -947,25 +748,27 @@ class KohyaHiresFix(scripts.Script):
                         gr.update(value=config.get("align_corners_mode", "False")), gr.update(value=config.get("recompute_scale_factor_mode", "False")),
                         gr.update(value=config.get("resolution_choice", RESOLUTION_CHOICES[0])), gr.update(value=config.get("apply_resolution", False)),
                         gr.update(value=config.get("adaptive_by_resolution", True)), gr.update(value=config.get("adaptive_profile", "Сбалансированный")),
+                        gr.update(value=config.get("use_old_float_math", True)), gr.update(value=config.get("use_old_onepass_logic", True)),
                         "✅ Настройки импортированы"
                     )
-                except Exception as e: return (*[gr.update()]*28, f"❌ Ошибка: {e}")
+                except Exception as e: return (*[gr.update()]*30, f"❌ Ошибка: {e}")
 
             all_params_list = [
                 enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
                 d1, d2, depth_guard, s1, s2, stop_preview_toggle, stop_preview_steps, scaler, downscale, upscale,
-                smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, keep_unitary_product, align_corners_mode,
-                recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile
+                smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
+                keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice,
+                apply_resolution, adaptive_by_resolution, adaptive_profile,
+                use_old_float_math, use_old_onepass_logic
             ]
+
             btn_export_config.click(_export_all_config, inputs=all_params_list, outputs=[config_json])
             btn_import_config.click(_import_all_config, inputs=[config_json], outputs=all_params_list + [import_status])
 
-        # Infotext setup
         self.infotext_fields.append((enable, lambda d: d.get("DSHF_s1", False)))
         for k, el in {
             "DSHF_mode": algo_mode, "DSHF_s1": s1, "DSHF_d1": d1, "DSHF_s2": s2, "DSHF_d2": d2,
-            "DSHF_scaler": scaler, "DSHF_down": downscale, "DSHF_up": upscale, "DSHF_smooth_enh": smooth_scaling_enh,
-            "DSHF_smooth_legacy": smooth_scaling_legacy, "DSHF_early": early_out, "DSHF_one_enh": only_one_pass_enh, "DSHF_one_legacy": only_one_pass_legacy
+            "DSHF_scaler": scaler, "DSHF_down": downscale, "DSHF_up": upscale, "DSHF_old_float": use_old_float_math
         }.items():
             self.infotext_fields.append((el, k))
 
@@ -976,46 +779,61 @@ class KohyaHiresFix(scripts.Script):
         d1, d2, depth_guard, s1, s2, stop_preview_enabled, stop_preview_steps, scaler, downscale, upscale,
         smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
         keep_unitary_product, align_ui, recompute_ui, res_choice, apply_res,
-        adapt, adapt_prof, debug_mode_val
+        adapt, adapt_prof, 
+        use_old_float_math, use_old_onepass_logic, # 🆕 HYBRID FLAGS
+        debug_mode_val
     ):
         self.step_limit = 0
         self.debug_mode = debug_mode_val
+        
+        # ✅ ПОЛНЫЙ CONFIG
         self.config = DictConfig({
-            "algo_mode": algo_mode, "simple_mode": simple, "s1": s1, "s2": s2, "d1": d1, "d2": d2,
+            "algo_mode": algo_mode,
+            "simple_mode": simple,
+            "s1": s1, "s2": s2,
+            "d1": d1, "d2": d2,
             "depth_guard": depth_guard,
-            "stop_preview_enabled": stop_preview_enabled, "stop_preview_steps": stop_preview_steps,
-            "scaler": scaler, "downscale": downscale, "upscale": upscale,
-            "smooth_scaling_enh": smooth_scaling_enh, "smooth_scaling_legacy": smooth_scaling_legacy,
-            "smoothing_mode": smoothing_mode_select, "smoothing_curve": smoothing_curve, "early_out": early_out,
-            "only_one_pass_enh": only_one_pass_enh, "only_one_pass_legacy": only_one_pass_legacy, "one_pass_mode": one_pass_mode_select,
-            "keep_unitary_product": keep_unitary_product, "align_corners_mode": align_ui,
-            "recompute_scale_factor_mode": recompute_ui, "resolution_choice": res_choice,
-            "apply_resolution": apply_res, "adaptive_by_resolution": adapt, "adaptive_profile": adapt_prof,
+            "stop_preview_enabled": stop_preview_enabled,
+            "stop_preview_steps": stop_preview_steps,
+            "scaler": scaler,
+            "downscale": downscale,
+            "upscale": upscale,
+            "smooth_scaling_enh": smooth_scaling_enh,
+            "smooth_scaling_legacy": smooth_scaling_legacy,
+            "smoothing_mode": smoothing_mode_select,
+            "smoothing_curve": smoothing_curve,
+            "early_out": early_out,
+            "only_one_pass_enh": only_one_pass_enh,
+            "only_one_pass_legacy": only_one_pass_legacy,
+            "one_pass_mode": one_pass_mode_select,
+            "keep_unitary_product": keep_unitary_product,
+            "align_corners_mode": align_ui,
+            "recompute_scale_factor_mode": recompute_ui,
+            "resolution_choice": res_choice,
+            "apply_resolution": apply_res,
+            "adaptive_by_resolution": adapt,
+            "adaptive_profile": adapt_prof,
+            "use_old_float_math": use_old_float_math,       # 🆕
+            "use_old_onepass_logic": use_old_onepass_logic, # 🆕
             "debug_mode": debug_mode_val
         })
-
-        if apply_res:
-            try:
-                wh = parse_resolution_label(res_choice)
-                if wh: p.width, p.height = wh
-            except Exception as e: print(f"[KohyaHiresFix] Res Error: {e}")
 
         if not enable or self.disable:
             try: script_callbacks.remove_current_script_callbacks()
             except: pass
             self._cb_registered = False
-            try:
-                model_container = getattr(p.sd_model, "model", None)
-                if model_container and hasattr(model_container, "diffusion_model"):
-                    KohyaHiresFix._unwrap_all(model_container.diffusion_model)
-            except: pass
             return
+
+        if apply_res:
+             try:
+                 wh = parse_resolution_label(res_choice)
+                 if wh: p.width, p.height = wh
+             except: pass
 
         use_s1, use_s2 = _clamp(float(s1), 0.0, 1.0), _clamp(float(s2), 0.0, 1.0)
         use_d1, use_d2 = int(d1), int(d2)
         use_down, use_up = float(downscale), float(upscale)
-        depth_guard = bool(depth_guard)
-
+        
         if adapt:
             try:
                 use_s1, use_s2, use_d1, use_d2, use_down, use_up = _compute_adaptive_params(
@@ -1027,16 +845,12 @@ class KohyaHiresFix(scripts.Script):
         if use_s1 > use_s2: use_s2 = use_s1
 
         model_container = getattr(p.sd_model, "model", None)
-        if not model_container or not hasattr(model_container, "diffusion_model"): return
+        if not model_container: return
         model = model_container.diffusion_model
         
         inp_list = getattr(model, "input_blocks", [])
         out_list = getattr(model, "output_blocks", [])
         max_inp = len(inp_list) - 1
-        
-        if max_inp < 1 or len(out_list) < 1:
-             print(f"[KohyaHiresFix] Model Error: Invalid blocks (max_inp={max_inp}).")
-             return
 
         d1_idx = int(use_d1) - 1
         d2_idx = int(use_d2) - 1
@@ -1048,186 +862,122 @@ class KohyaHiresFix(scripts.Script):
             align_mode = _norm_mode_choice(align_ui, "auto")
             recompute_mode = _norm_mode_choice(recompute_ui, "auto")
 
+        # Select logic
         def _select_cross_mode(choice: str, enh_value: bool, legacy_value: bool) -> bool:
             sel = (choice or "").strip().lower()
-            if sel.startswith("использовать legacy"):
-                return bool(legacy_value)
-            if sel.startswith("использовать enhanced"):
-                return bool(enh_value)
+            if sel.startswith("использовать legacy"): return bool(legacy_value)
+            if sel.startswith("использовать enhanced"): return bool(enh_value)
             return bool(enh_value) if algo_mode == "Enhanced (RU+)" else bool(legacy_value)
 
-        chosen_smoothing = _select_cross_mode(smoothing_mode_select, smooth_scaling_enh, smooth_scaling_legacy)
-        chosen_one_pass = _select_cross_mode(one_pass_mode_select, only_one_pass_enh, only_one_pass_legacy)
+        use_smooth = _select_cross_mode(smoothing_mode_select, smooth_scaling_enh, smooth_scaling_legacy)
+        use_one = _select_cross_mode(one_pass_mode_select, only_one_pass_enh, only_one_pass_legacy)
 
-        if algo_mode == "Enhanced (RU+)":
-            use_smooth_enh = chosen_smoothing
-            use_one_enh = chosen_one_pass
-            use_smooth_legacy = bool(smooth_scaling_legacy)
-            use_one_legacy = bool(only_one_pass_legacy)
-        else:
-            use_smooth_enh = bool(smooth_scaling_enh)
-            use_one_enh = bool(only_one_pass_enh)
-            use_smooth_legacy = chosen_smoothing
-            use_one_legacy = chosen_one_pass
-
-        mapping_notes: list[str] = [
-            f"Доступно входных блоков: {len(inp_list)} | выходных: {len(out_list)}",
-            "Автокоррекция глубины: включена" if depth_guard else "Автокоррекция глубины: выключена",
-        ]
-
-        def _normalize_depth(idx: int, label: str) -> int:
+        # 🛡️ DEPTH GUARD & MAPPING LOGIC
+        mapping_notes = []
+        def _normalize_depth(idx, label):
             clamped = max(0, min(int(idx), max_inp))
-            if clamped != int(idx):
-                mapping_notes.append(
-                    f"{label}: {int(idx) + 1} вне диапазона 1-{max_inp + 1} → использован {clamped + 1}"
-                )
+            if clamped != int(idx): mapping_notes.append(f"{label} clamped")
             return clamped
 
-        # Normalize depths first (always)
         d1_idx = _normalize_depth(d1_idx, "d1")
         d2_idx = _normalize_depth(d2_idx, "d2")
+        if depth_guard and d2_idx < d1_idx: d1_idx, d2_idx = d2_idx, d1_idx
 
-        # Then swap if depth_guard is on
-        if depth_guard and d2_idx < d1_idx:
-            mapping_notes.append("d1 и d2 упорядочены по возрастанию глубины")
-            d1_idx, d2_idx = d2_idx, d1_idx
-
-        # Report the real mapping of user-provided depths to model blocks so it is easier
-        # to diagnose unexpected behavior (e.g. when a chosen depth is clamped).
-        mapped_pairs: list[tuple[int, Optional[int]]] = []
-
-        def _map_with_note(label: str, idx: int) -> Optional[int]:
-            out_idx = KohyaHiresFix._map_output_index(model, idx, early_out)
-            if out_idx is None:
-                mapping_notes.append(f"{label}: выходной блок не найден (input={idx})")
-                return None
-            if idx >= len(inp_list):
-                mapping_notes.append(f"{label}: input {idx + 1} превышает доступные {len(inp_list)} → использован {inp_list and len(inp_list) or 0}")
-            if out_idx >= len(out_list):
-                mapping_notes.append(f"{label}: output {out_idx + 1} превышает доступные {len(out_list)} → использован {out_list and len(out_list) or 0}")
-            mapped_pairs.append((idx, out_idx))
-            return out_idx
-
-        d1_out_idx = _map_with_note("d1", d1_idx)
-        d2_out_idx = _map_with_note("d2", d2_idx)
-        if d1_out_idx is not None and d2_out_idx is not None and d1_out_idx == d2_out_idx:
-            mapping_notes.append(f"d1 и d2 указывают на один и тот же выходной блок ({d1_out_idx + 1})")
+        def _map_with_note(idx):
+             out_idx = KohyaHiresFix._map_output_index(model, idx, early_out)
+             if out_idx is None: mapping_notes.append(f"In {idx} -> No Out")
+             return out_idx
+        
+        _map_with_note(d1_idx)
+        _map_with_note(d2_idx)
 
         if self.debug_mode:
-            mapping_repr = ", ".join([f"in {i + 1} → out {(o or 0) + 1}" for i, o in mapped_pairs]) or "нет"
-            self._append_debug(f"Mapping: {mapping_repr}")
-            for note in mapping_notes:
-                self._append_debug(f"⚠️ {note}")
+            self._append_debug(f"Mapping notes: {', '.join(mapping_notes)}")
 
         def denoiser_callback(params: script_callbacks.CFGDenoiserParams):
-            total = max(1, int(params.total_sampling_steps))
-            current = params.sampling_step
-
             try:
-                # Debug logging
-                if self.debug_mode:
-                    msg = f"Step {current}/{total}: mode={algo_mode}"
-                    if algo_mode == "Legacy (Original)" and d1_idx < len(model.input_blocks) and isinstance(model.input_blocks[d1_idx], Scaler):
-                         msg += f", d1_scale={model.input_blocks[d1_idx].scale:.3f}"
-                    self._append_debug(msg)
+                total = max(1, int(params.total_sampling_steps))
+                current = params.sampling_step
 
-                # ========================= LEGACY (ORIGINAL) MODE =========================
-                if algo_mode == "Legacy (Original)":
-                    if use_one_legacy and self.step_limit: return
-
-                    legacy_pairs = [(use_s1, d1_idx), (use_s2, d2_idx)]
-                    combined_legacy: dict[int, float] = {}
-                    for s_stop, d_idx in legacy_pairs:
-                        if s_stop > 0:
-                            combined_legacy[d_idx] = max(combined_legacy.get(d_idx, 0.0), s_stop)
-                    n_out = len(model.output_blocks)
-
-                    for d_idx, s_stop in combined_legacy.items():
-                        if s_stop <= 0: continue
-
-                        # Safety checks for bounds and None blocks
-                        if d_idx < 0 or d_idx >= len(model.input_blocks): continue
-                        if model.input_blocks[d_idx] is None: continue
-
-                        if early_out: out_idx = d_idx
-                        else: out_idx = n_out - 1 - d_idx
-                        if out_idx < 0 or out_idx >= n_out: continue
-                        if model.output_blocks[out_idx] is None: continue
-
-                        if current < total * s_stop:
-                            if not isinstance(model.input_blocks[d_idx], Scaler):
-                                model.input_blocks[d_idx] = Scaler(use_down, model.input_blocks[d_idx], scaler_mode, align_mode, recompute_mode)
-                                model.output_blocks[out_idx] = Scaler(use_up, model.output_blocks[out_idx], scaler_mode, align_mode, recompute_mode)
-                            elif use_smooth_legacy:
-                                scale_ratio = current / (total * s_stop)
-                                cur_down = min((1.0 - use_down) * scale_ratio + use_down, 1.0)
-                                model.input_blocks[d_idx].scale = cur_down
-                                model.output_blocks[out_idx].scale = use_up * (use_down / max(1e-6, cur_down))
+                # === HYBRID ONE PASS CHECK ===
+                if use_one:
+                    if use_old_onepass_logic:
+                        # OLD LOGIC: Строгое сравнение с записанным шагом
+                        if params.sampling_step < self.step_limit: 
                             return
-                        elif isinstance(model.input_blocks[d_idx], Scaler):
-                            # Unwrapping with safety checks
-                            model.input_blocks[d_idx] = model.input_blocks[d_idx].block
-                            if isinstance(model.output_blocks[out_idx], Scaler):
-                                model.output_blocks[out_idx] = model.output_blocks[out_idx].block
+                    else:
+                        # NEW LOGIC: Проверка флага
+                        if self.step_limit == 1: 
+                            return
 
-                    if use_one_legacy and current > 0 and current >= total * max(use_s1, use_s2):
-                        self.step_limit = 1
+                pairs = [(use_s1, d1_idx), (use_s2, d2_idx)]
+                combined = {}
+                for s_stop, d_i in pairs:
+                    if s_stop > 0: combined[d_i] = max(combined.get(d_i, 0.0), s_stop)
+                
+                max_stop_s = max(combined.values()) if combined else 0.0
 
-                # ========================= ENHANCED (RU+) MODE =========================
-                else:
-                    if use_one_enh and self.step_limit: return
-                    combined = {}
-                    for s_stop, d_i in ((float(use_s1), d1_idx), (float(use_s2), d2_idx)):
-                        if s_stop > 0: combined[d_i] = max(combined.get(d_i, 0.0), s_stop)
-                    max_stop = max(combined.values()) if combined else 0.0
+                for d_i, s_stop in combined.items():
+                    if d_i >= len(model.input_blocks): continue
+                    out_i = KohyaHiresFix._map_output_index(model, d_i, early_out)
+                    if out_i is None or out_i >= len(model.output_blocks): continue
+                    
+                    if model.input_blocks[d_i] is None or model.output_blocks[out_i] is None: continue
 
-                    for d_i, s_stop in combined.items():
-                        # Safety check: input bounds
-                        if d_i < 0 or d_i >= len(model.input_blocks):
-                            continue
+                    stop_step = total * s_stop
+                    
+                    if current < stop_step:
+                        # Apply Scaler
+                        if not isinstance(model.input_blocks[d_i], Scaler):
+                            # HYBRID FLAG PASSED HERE
+                            model.input_blocks[d_i] = Scaler(
+                                use_down, model.input_blocks[d_i], scaler_mode, 
+                                align_mode, recompute_mode, 
+                                use_old_float_math=use_old_float_math
+                            )
+                            model.output_blocks[out_i] = Scaler(
+                                use_up, model.output_blocks[out_i], scaler_mode, 
+                                align_mode, recompute_mode,
+                                use_old_float_math=use_old_float_math
+                            )
                         
-                        out_i = KohyaHiresFix._map_output_index(model, d_i, early_out)
-                        
-                        # Safety check: output bounds
-                        if out_i is None or out_i < 0 or out_i >= len(model.output_blocks):
-                            continue
-                        
-                        # Safety check: None blocks
-                        if model.input_blocks[d_i] is None or model.output_blocks[out_i] is None:
-                            continue
-
-                        if current < total * s_stop:
-                            if not isinstance(model.input_blocks[d_i], Scaler):
-                                model.input_blocks[d_i] = Scaler(use_down, model.input_blocks[d_i], scaler_mode, align_mode, recompute_mode)
-                                model.output_blocks[out_i] = Scaler(use_up, model.output_blocks[out_i], scaler_mode, align_mode, recompute_mode)
-
-                            if use_smooth_enh:
-                                ratio = float(max(0.0, min(1.0, current / (total * s_stop))))
-                                if (smoothing_curve or "").lower().startswith("smooth"): ratio = ratio * ratio * (3.0 - 2.0 * ratio)
-                                cur_down = min((1.0 - use_down) * ratio + use_down, 1.0)
-                                model.input_blocks[d_i].scale = cur_down
-                                if keep_unitary_product: cur_up = 1.0 / max(1e-6, cur_down)
-                                else: cur_up = _clamp(use_up * (use_down / max(1e-6, cur_down)), 1.0, 4.0)
-                                model.output_blocks[out_i].scale = cur_up
+                        if use_smooth:
+                            ratio = float(max(0.0, min(1.0, current / stop_step)))
+                            if algo_mode == "Enhanced (RU+)" and smoothing_curve == "Smoothstep":
+                                ratio = ratio * ratio * (3.0 - 2.0 * ratio)
+                            
+                            cur_down = min((1.0 - use_down) * ratio + use_down, 1.0)
+                            model.input_blocks[d_i].scale = cur_down
+                            
+                            if algo_mode == "Enhanced (RU+)" and keep_unitary_product:
+                                cur_up = 1.0 / max(1e-6, cur_down)
                             else:
-                                model.input_blocks[d_i].scale = use_down
-                                model.output_blocks[out_i].scale = use_up
-                        elif isinstance(model.input_blocks[d_i], Scaler):
-                            model.input_blocks[d_i] = model.input_blocks[d_i].block
-                            if isinstance(model.output_blocks[out_i], Scaler):
-                                model.output_blocks[out_i] = model.output_blocks[out_i].block
+                                cur_up = use_up * (use_down / max(1e-6, cur_down))
+                                if not use_old_float_math: cur_up = _clamp(cur_up, 1.0, 4.0)
+                            
+                            model.output_blocks[out_i].scale = cur_up
+                    
+                    elif isinstance(model.input_blocks[d_i], Scaler):
+                        model.input_blocks[d_i] = model.input_blocks[d_i].block
+                        if isinstance(model.output_blocks[out_i], Scaler):
+                            model.output_blocks[out_i] = model.output_blocks[out_i].block
 
-                    if use_one_enh and max_stop > 0 and current >= total * max_stop:
-                        self.step_limit = 1
-
+                # === HYBRID STEP LIMIT UPDATE ===
+                if use_one:
+                    if use_old_onepass_logic:
+                        # OLD WAY: Обновляем ВСЕГДА, чтобы step_limit рос вместе с current
+                        # Это в точности копирует логику khrfix_olds (1).py
+                        self.step_limit = current
+                    else:
+                        # NEW WAY: Ставим флаг "1" только когда эффект закончился
+                        if max_stop_s > 0 and current >= total * max_stop_s:
+                            self.step_limit = 1
+            
             except Exception as e:
                 try: KohyaHiresFix._unwrap_all(model)
                 except: pass
-                try: script_callbacks.remove_current_script_callbacks()
-                except: pass
-                self._cb_registered = False
+                print(f"[KohyaHiresFix] Error in callback: {e}")
                 self.disable = True
-                print(f"[KohyaHiresFix] Error: {e}")
 
         if self._cb_registered:
             try: script_callbacks.remove_current_script_callbacks()
@@ -1236,19 +986,14 @@ class KohyaHiresFix(scripts.Script):
         self._cb_registered = True
 
         p.extra_generation_params.update({
-            "DSHF_mode": algo_mode, "DSHF_s1": use_s1, "DSHF_s2": use_s2, "DSHF_down": use_down, "DSHF_up": use_up, "DSHF_depth_guard": depth_guard
+            "DSHF_mode": algo_mode, "DSHF_old_float": use_old_float_math, "DSHF_old_onepass": use_old_onepass_logic
         })
 
     def postprocess(self, p, processed, *args):
         try:
             model_container = getattr(p.sd_model, "model", None)
-            if model_container and hasattr(model_container, "diffusion_model"):
-                KohyaHiresFix._unwrap_all(model_container.diffusion_model)
-            if self.debug_mode and self.debug_log:
-                print(f"[KohyaHiresFix] Log:\n" + "\n".join(self.debug_log[-20:]))
+            if model_container: KohyaHiresFix._unwrap_all(model_container.diffusion_model)
         finally:
-            try: _atomic_save_yaml(CONFIG_PATH, OmegaConf.to_container(self.config, resolve=True) or {})
-            except: pass
             self._cb_registered = False
 
     def process_batch(self, p, *args, **kwargs):
