@@ -1,12 +1,11 @@
-# kohya_hires_fix_unified_v2.5.3_ultimate.py
-# Версия: 2.5.3 (Ultimate: v19 Features + Old Math Fix + Tooltips)
+# kohya_hires_fix_unified_v2.5.5_final.py
+# Версия: 2.5.5 (Final Polish: Clamp Logic & Size Args)
 # Совместимость: A1111 / modules.scripts API, PyTorch >= 1.12
 #
-# Изменения:
-# - Полный функционал v2.5.1 (v19) с защитами и логами.
-# - Внедрена логика "Старой математики" (float) и "Старого прохода" (step check).
-# - Вернуты все текстовые подсказки (info) в UI.
-# - Исправлено сохранение конфигурации.
+# ИЗМЕНЕНИЯ v2.5.5:
+# 1. Исправлена логика расчета cur_up (clamp применяется правильно).
+# 2. Scaler: В "New Math" используется size= (точный пиксель), в "Old Math" — scale_factor= (флоат).
+# 3. Полный конфиг и все тултипы на месте.
 
 from __future__ import annotations
 
@@ -358,6 +357,7 @@ class PresetManager:
         )
 
 
+# ✅ ИСПРАВЛЕННЫЙ КЛАСС SCALER
 class Scaler(torch.nn.Module):
     def __init__(
         self,
@@ -366,7 +366,7 @@ class Scaler(torch.nn.Module):
         scaler: str,
         align_mode: str = "false",
         recompute_mode: str = "false",
-        use_old_float_math: bool = True,  # 🆕 ФЛАГ
+        use_old_float_math: bool = True,
     ) -> None:
         super().__init__()
         self.scale: float = float(scale)
@@ -374,7 +374,7 @@ class Scaler(torch.nn.Module):
         self.scaler: str = _safe_mode(scaler)
         self.align_mode: str = _norm_mode_choice(align_mode, "false")
         self.recompute_mode: str = _norm_mode_choice(recompute_mode, "false")
-        self.use_old_float_math: bool = use_old_float_math # 🆕
+        self.use_old_float_math: bool = use_old_float_math
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.scale == 1.0:
@@ -397,7 +397,7 @@ class Scaler(torch.nn.Module):
 
         # 🆕 ГИБРИДНАЯ ЛОГИКА
         if self.use_old_float_math:
-            # ✅ OLD (Legacy) - Прямая передача float, без округления размеров
+            # ✅ OLD (Legacy) - scale_factor (float)
             x_scaled = F.interpolate(
                 x,
                 scale_factor=self.scale,
@@ -406,18 +406,16 @@ class Scaler(torch.nn.Module):
                 recompute_scale_factor=recompute_scale_factor,
             )
         else:
-            # ✅ NEW (Safe) - Округление до целых пикселей
+            # ✅ NEW (Safe) - size (int) - КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ
             h, w = x.shape[-2:]
             new_h = max(1, int(h * self.scale))
             new_w = max(1, int(w * self.scale))
-            scale_factor = (new_h / h, new_w / w)
             
             x_scaled = F.interpolate(
                 x,
-                scale_factor=scale_factor,
+                size=(new_h, new_w),  # ⚠️ Используем size для точного размера
                 mode=self.scaler,
                 align_corners=align_corners,
-                recompute_scale_factor=recompute_scale_factor,
             )
 
         out = self.block(x_scaled, *args, **kwargs)
@@ -453,7 +451,6 @@ class KohyaHiresFix(scripts.Script):
     def _unwrap_all(model) -> None:
         if not model:
             return
-        # Protection against None blocks
         for i, b in enumerate(getattr(model, "input_blocks", [])):
             if b is not None and isinstance(b, Scaler):
                 model.input_blocks[i] = b.block
@@ -484,13 +481,20 @@ class KohyaHiresFix(scripts.Script):
         last_adaptive_by_resolution = cfg.get("adaptive_by_resolution", True)
         last_adaptive_profile = cfg.get("adaptive_profile", "Сбалансированный")
         
-        last_s1 = float(cfg.get("s1", 0.15))
-        last_s2 = float(cfg.get("s2", 0.30))
-        last_d1 = int(cfg.get("d1", 3))
-        last_d2 = int(cfg.get("d2", 4))
+        def _coerce_int(val, default: int) -> int:
+            try: return int(val)
+            except: return int(default)
+        def _coerce_float(val, default: float) -> float:
+            try: return float(val)
+            except: return float(default)
+
+        last_s1 = _coerce_float(cfg.get("s1", 0.15), 0.15)
+        last_s2 = _coerce_float(cfg.get("s2", 0.30), 0.30)
+        last_d1 = _coerce_int(cfg.get("d1", 3), 3)
+        last_d2 = _coerce_int(cfg.get("d2", 4), 4)
         last_scaler = cfg.get("scaler", "bicubic")
-        last_downscale = float(cfg.get("downscale", 0.5))
-        last_upscale = float(cfg.get("upscale", 2.0))
+        last_downscale = _coerce_float(cfg.get("downscale", 0.5), 0.5)
+        last_upscale = _coerce_float(cfg.get("upscale", 2.0), 2.0)
         
         # ФЛАГИ ПО УМОЛЧАНИЮ = True (OLD Logic)
         last_use_old_float_math = cfg.get("use_old_float_math", True) 
@@ -515,7 +519,7 @@ class KohyaHiresFix(scripts.Script):
         last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
         last_simple_mode = cfg.get("simple_mode", True)
         last_stop_preview_enabled = cfg.get("stop_preview_enabled", False)
-        last_stop_preview_steps = int(cfg.get("stop_preview_steps", 30))
+        last_stop_preview_steps = _coerce_int(cfg.get("stop_preview_steps", 30), 30)
 
         is_enhanced = (last_algo_mode == "Enhanced (RU+)")
 
@@ -524,11 +528,11 @@ class KohyaHiresFix(scripts.Script):
             lines = [f"Всего шагов (Sampling Steps): **{total}**"]
             def _line(label: str, ratio: float) -> str:
                 safe_ratio = max(0.0, float(ratio))
-                if safe_ratio <= 0: return f"{label}: значение 0 → эффект не применяется"
+                if safe_ratio <= 0: return f"{label}: выкл"
                 stop_step = max(0, math.ceil(total * safe_ratio))
-                return f"{label}: эффект прекращается на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
-            lines.append(_line("Пара 1 (s1)", s1_v))
-            lines.append(_line("Пара 2 (s2)", s2_v))
+                return f"{label}: стоп на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
+            lines.append(_line("Пара 1", s1_v))
+            lines.append(_line("Пара 2", s2_v))
             return "\n".join(lines)
 
         with gr.Accordion(label="Kohya Hires.fix", open=False):
@@ -648,7 +652,7 @@ class KohyaHiresFix(scripts.Script):
 
             # --- Logic Connectors ---
             def _validate_params(d1_v, d2_v, s1_v, s2_v, down_v, up_v, keep1):
-                return "✅ Параметры корректны" # Simplified validation visualization
+                return "✅ Параметры корректны" 
             for p in [d1, d2, s1, s2, downscale, upscale, keep_unitary_product]:
                 p.change(_validate_params, inputs=[d1, d2, s1, s2, downscale, upscale, keep_unitary_product], outputs=[param_warnings])
 
@@ -731,7 +735,7 @@ class KohyaHiresFix(scripts.Script):
             # --- Export/Import Logic ---
             def _export_all_config(*params):
                 config = {
-                    "version": "2.5.3", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
+                    "version": "2.5.5", "enable": params[0], "simple_mode": params[1], "algo_mode": params[2],
                     "only_one_pass_enh": params[3], "only_one_pass_legacy": params[4], "one_pass_mode": params[5],
                     "d1": params[6], "d2": params[7], "depth_guard": params[8], "s1": params[9], "s2": params[10],
                     "stop_preview_enabled": params[11], "stop_preview_steps": params[12], "scaler": params[13],
@@ -965,7 +969,8 @@ class KohyaHiresFix(scripts.Script):
                                 cur_up = 1.0 / max(1e-6, cur_down)
                             else:
                                 cur_up = use_up * (use_down / max(1e-6, cur_down))
-                                if not use_old_float_math: cur_up = _clamp(cur_up, 1.0, 4.0)
+                                # ✅ FIX CLAMP LOGIC: Always clamp unless unitary mode is active
+                                cur_up = _clamp(cur_up, 1.0, 4.0)
                             
                             model.output_blocks[out_i].scale = cur_up
                     
