@@ -1,12 +1,12 @@
 # kohya_hires_fix_unified_v2.5.3_ultimate.py
-# Версия: 2.5.3 (Ultimate: v19 Features + Old Math Fix)
+# Версия: 2.5.3 (Ultimate: v19 Features + Old Math Fix + Tooltips)
 # Совместимость: A1111 / modules.scripts API, PyTorch >= 1.12
 #
 # Изменения:
-# - В основе лежит код версии 2.5.1 (v19) со всеми проверками безопасности и логами.
-# - Внедрена логика "Старой математики" (float vs int) для резкости.
-# - Внедрена логика "Старого одного прохода" (step vs flag).
-# - Исправлено сохранение конфига и логика step_limit.
+# - Полный функционал v2.5.1 (v19) с защитами и логами.
+# - Внедрена логика "Старой математики" (float) и "Старого прохода" (step check).
+# - Вернуты все текстовые подсказки (info) в UI.
+# - Исправлено сохранение конфигурации.
 
 from __future__ import annotations
 
@@ -203,7 +203,7 @@ class HiresPreset:
         self.adaptive_by_resolution: bool = True
         self.adaptive_profile: str = "Сбалансированный"
 
-        # 🆕 НОВЫЕ ФЛАГИ (из v2.5.2)
+        # 🆕 НОВЫЕ ФЛАГИ
         self.use_old_float_math: bool = True
         self.use_old_onepass_logic: bool = True
 
@@ -521,20 +521,20 @@ class KohyaHiresFix(scripts.Script):
 
         def _format_stop_preview_text(total_steps: int, s1_v: float, s2_v: float) -> str:
             total = max(1, int(total_steps))
-            lines = [f"Всего шагов: **{total}**"]
+            lines = [f"Всего шагов (Sampling Steps): **{total}**"]
             def _line(label: str, ratio: float) -> str:
                 safe_ratio = max(0.0, float(ratio))
-                if safe_ratio <= 0: return f"{label}: выкл"
+                if safe_ratio <= 0: return f"{label}: значение 0 → эффект не применяется"
                 stop_step = max(0, math.ceil(total * safe_ratio))
-                return f"{label}: стоп на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
-            lines.append(_line("Пара 1", s1_v))
-            lines.append(_line("Пара 2", s2_v))
+                return f"{label}: эффект прекращается на шаге **{min(total, stop_step)}** (s={safe_ratio:.2f})"
+            lines.append(_line("Пара 1 (s1)", s1_v))
+            lines.append(_line("Пара 2 (s2)", s2_v))
             return "\n".join(lines)
 
         with gr.Accordion(label="Kohya Hires.fix", open=False):
             with gr.Row():
                 enable = gr.Checkbox(label="Включить расширение", value=False)
-                algo_mode = gr.Radio(choices=["Enhanced (RU+)", "Legacy (Original)"], value=last_algo_mode, label="Алгоритм")
+                algo_mode = gr.Radio(choices=["Enhanced (RU+)", "Legacy (Original)"], value=last_algo_mode, label="Алгоритм работы / Algorithm Mode")
                 status_indicator = gr.Markdown("🔴 **Отключено**", elem_classes=["status-indicator"])
 
             with gr.Row():
@@ -544,23 +544,30 @@ class KohyaHiresFix(scripts.Script):
                 btn_quick_aggressive = gr.Button("🔥 Агрессивный", size="sm", variant="secondary")
 
             with gr.Row():
-                simple_mode = gr.Checkbox(label="Простой режим", value=last_simple_mode)
+                simple_mode = gr.Checkbox(label="Простой режим (скрыть продвинутые настройки)", value=last_simple_mode)
 
             with gr.Group():
-                gr.Markdown("**Базовые параметры**")
+                gr.Markdown("**Базовые параметры hires.fix**")
                 with gr.Row():
-                    s1 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить (s1)", value=last_s1)
-                    d1 = gr.Slider(1, 10, step=1, label="Глубина (d1)", value=last_d1)
+                    s1 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 1", value=last_s1,
+                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для первой пары блоков")
+                    d1 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 1", value=last_d1,
+                                   info="Индекс блока UNet (1-10). Меньше = раньше в сети")
                 with gr.Row():
-                    s2 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить (s2)", value=last_s2)
-                    d2 = gr.Slider(1, 10, step=1, label="Глубина (d2)", value=last_d2)
+                    s2 = gr.Slider(0.0, 1.0, step=0.01, label="Остановить на (доля шага) — Пара 2", value=last_s2,
+                                   info="На какой доле шагов (0.0-1.0) начать применять downscale для второй пары блоков")
+                    d2 = gr.Slider(1, 10, step=1, label="Глубина блока — Пара 2", value=last_d2,
+                                   info="Индекс блока UNet (1-10). Меньше = раньше в сети")
                 with gr.Row():
-                    stop_preview_toggle = gr.Checkbox(label="Визуализация остановки", value=last_stop_preview_enabled)
-                    stop_preview_steps = gr.Slider(1, 200, step=1, label="Шаги семплера", value=last_stop_preview_steps, visible=last_stop_preview_enabled)
+                    stop_preview_toggle = gr.Checkbox(label="Показывать визуализацию шага остановки", value=last_stop_preview_enabled,
+                                                      info="Вспомогательный расчёт шага, на котором прекращается эффект для выбранных s1/s2")
+                    stop_preview_steps = gr.Slider(1, 200, step=1, label="Всего шагов (Sampling Steps)", value=last_stop_preview_steps, visible=last_stop_preview_enabled,
+                                                   info="Общее число шагов семплера для расчёта шага остановки")
                 stop_preview_md = gr.Markdown(value=_format_stop_preview_text(last_stop_preview_steps, last_s1, last_s2) if last_stop_preview_enabled else "", visible=last_stop_preview_enabled)
 
                 with gr.Row():
-                    depth_guard = gr.Checkbox(label="Автокоррекция глубины", value=last_depth_guard)
+                    depth_guard = gr.Checkbox(label="Автокоррекция глубины блоков", value=last_depth_guard,
+                                              info="Ограничивает выбранные индексы допустимым диапазоном модели и сортирует d1/d2 при необходимости")
 
                 # 🆕 ГРУППА СОВМЕСТИМОСТИ
                 with gr.Group():
@@ -569,24 +576,27 @@ class KohyaHiresFix(scripts.Script):
                         use_old_float_math = gr.Checkbox(
                             label="🛠️ Использовать \"Старую математику\" (Float)",
                             value=last_use_old_float_math,
-                            info="ВКЛ: передает scale_factor напрямую (OLD). ВЫКЛ: с округлением int() (NEW)"
+                            info="ВКЛ: передает scale_factor напрямую (OLD). ВЫКЛ: с округлением int() (NEW). Рекомендуется ВКЛ для резкости."
                         )
                         use_old_onepass_logic = gr.Checkbox(
                             label="🛠️ Строгий режим \"Один проход\" (Old Logic)",
                             value=last_use_old_onepass_logic,
-                            info="ВКЛ: запоминает номер шага (OLD). ВЫКЛ: использует флаг (NEW)"
+                            info="ВКЛ: запоминает номер шага (OLD). ВЫКЛ: использует флаг (NEW). Рекомендуется ВКЛ для совместимости."
                         )
 
                 with gr.Row():
-                    scaler = gr.Dropdown(choices=["bicubic", "bilinear", "nearest", "nearest-exact"], label="Интерполяция", value=last_scaler)
-                    downscale = gr.Slider(0.1, 1.0, step=0.05, label="Downscale", value=last_downscale)
-                    upscale = gr.Slider(1.0, 4.0, step=0.1, label="Upscale", value=last_upscale)
+                    scaler = gr.Dropdown(choices=["bicubic", "bilinear", "nearest", "nearest-exact"], label="Режим интерполяции слоя", value=last_scaler)
+                    downscale = gr.Slider(0.1, 1.0, step=0.05, label="Коэффициент даунскейла (вход)", value=last_downscale,
+                                          info="Уменьшение размера входного тензора. 0.5 = половина размера")
+                    upscale = gr.Slider(1.0, 4.0, step=0.1, label="Коэффициент апскейла (выход)", value=last_upscale,
+                                        info="Увеличение размера на выходе. Обычно = 1/downscale")
 
                 with gr.Row():
-                    early_out = gr.Checkbox(label="Early Out", value=last_early_out)
-                    only_one_pass_enh = gr.Checkbox(label="Только один проход (Enh)", value=last_only_enh, visible=is_enhanced)
-                    only_one_pass_legacy = gr.Checkbox(label="Только один проход (Leg)", value=last_only_leg, visible=not is_enhanced)
-                    one_pass_mode_select = gr.Dropdown(choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"], value=last_one_pass_mode, label="Логика One Pass")
+                    early_out = gr.Checkbox(label="Ранний апскейл (Early Out)", value=last_early_out)
+                    only_one_pass_enh = gr.Checkbox(label="Только один проход (Enhanced)", value=last_only_enh, visible=is_enhanced)
+                    only_one_pass_legacy = gr.Checkbox(label="Только один проход (Legacy old)", value=last_only_leg, visible=not is_enhanced)
+                    one_pass_mode_select = gr.Dropdown(choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"], value=last_one_pass_mode, label="Использовать логику одного прохода",
+                                                       info="Позволяет применять алгоритм одного прохода из другого режима.")
 
                 with gr.Row():
                     param_warnings = gr.Markdown("", elem_classes=["warning-box"])
@@ -595,27 +605,29 @@ class KohyaHiresFix(scripts.Script):
                 with gr.Group():
                     gr.Markdown("**Параметры сглаживания и разрешения**")
                     with gr.Row():
-                        smooth_scaling_enh = gr.Checkbox(label="Плавное изменение (Enh)", value=last_smooth_enh, visible=is_enhanced)
-                        smooth_scaling_legacy = gr.Checkbox(label="Плавное изменение (Leg)", value=last_smooth_leg, visible=not is_enhanced)
-                        smoothing_mode_select = gr.Dropdown(choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"], value=last_smoothing_mode, label="Логика сглаживания")
-                        smoothing_curve = gr.Dropdown(choices=["Линейная", "Smoothstep"], value=last_smoothing_curve, label="Кривая", visible=is_enhanced)
-                        keep_unitary_product = gr.Checkbox(label="Сохранять масштаб=1", value=last_keep1, visible=is_enhanced)
+                        smooth_scaling_enh = gr.Checkbox(label="Плавное изменение масштаба (Enhanced)", value=last_smooth_enh, visible=is_enhanced)
+                        smooth_scaling_legacy = gr.Checkbox(label="Плавное изменение масштаба (Legacy old)", value=last_smooth_leg, visible=not is_enhanced)
+                        smoothing_mode_select = gr.Dropdown(choices=["Авто (по алгоритму)", "Использовать Enhanced", "Использовать Legacy old"], value=last_smoothing_mode, label="Использовать логику сглаживания",
+                                                            info="Позволяет включить сглаживание другого режима (например, Legacy сглаживание в Enhanced).")
+                        smoothing_curve = gr.Dropdown(choices=["Линейная", "Smoothstep"], value=last_smoothing_curve, label="Кривая сглаживания", visible=is_enhanced)
+                        keep_unitary_product = gr.Checkbox(label="Сохранять суммарный масштаб = 1", value=last_keep1, visible=is_enhanced,
+                                                           info="Автоматически корректирует upscale так, чтобы down*up=1")
                     with gr.Row():
-                        resolution_choice = gr.Dropdown(choices=RESOLUTION_CHOICES, value=last_resolution_choice, label="Разрешение")
-                        apply_resolution = gr.Checkbox(label="Применить к W/H", value=last_apply_resolution)
-                        adaptive_by_resolution = gr.Checkbox(label="Адаптация", value=last_adaptive_by_resolution)
-                        adaptive_profile = gr.Dropdown(choices=["Консервативный", "Сбалансированный", "Агрессивный"], value=last_adaptive_profile, label="Профиль")
+                        resolution_choice = gr.Dropdown(choices=RESOLUTION_CHOICES, value=last_resolution_choice, label="Выбрать разрешение")
+                        apply_resolution = gr.Checkbox(label="Применить разрешение к width/height", value=last_apply_resolution)
+                        adaptive_by_resolution = gr.Checkbox(label="Адаптировать параметры под текущее разрешение", value=last_adaptive_by_resolution)
+                        adaptive_profile = gr.Dropdown(choices=["Консервативный", "Сбалансированный", "Агрессивный"], value=last_adaptive_profile, label="Профиль адаптации")
 
                 with gr.Group():
                     gr.Markdown("**Интерполяция (Advanced)**")
                     with gr.Row():
-                        align_corners_mode = gr.Dropdown(choices=["False", "True", "Авто"], value=last_align_mode, label="align_corners", visible=is_enhanced)
-                        recompute_scale_factor_mode = gr.Dropdown(choices=["False", "True", "Авто"], value=last_recompute_mode, label="recompute_scale_factor", visible=is_enhanced)
+                        align_corners_mode = gr.Dropdown(choices=["False", "True", "Авто"], value=last_align_mode, label="align_corners режим", visible=is_enhanced)
+                        recompute_scale_factor_mode = gr.Dropdown(choices=["False", "True", "Авто"], value=last_recompute_mode, label="recompute_scale_factor режим", visible=is_enhanced)
                 
                 with gr.Group():
                     gr.Markdown("**Пресеты / Импорт / Экспорт / Логи**")
                     with gr.Row():
-                        preset_category_filter = gr.Dropdown(choices=["Все"] + pm.categories(), value="Все", label="Категория")
+                        preset_category_filter = gr.Dropdown(choices=["Все"] + pm.categories(), value="Все", label="Категория (фильтр)")
                         preset_select = gr.Dropdown(choices=pm.names_for_category(None), value=None, label="Выбрать пресет")
                         btn_save = gr.Button("Сохранить", variant="primary")
                         btn_load = gr.Button("Загрузить")
@@ -625,14 +637,14 @@ class KohyaHiresFix(scripts.Script):
                          preset_category_input = gr.Textbox(placeholder="Категория...", show_label=False)
                     preset_status = gr.Markdown("")
                     with gr.Row():
-                        btn_export_config = gr.Button("Экспорт JSON")
-                        btn_import_config = gr.Button("Импорт JSON")
+                        btn_export_config = gr.Button("📤 Экспорт в JSON")
+                        btn_import_config = gr.Button("📥 Импорт из JSON")
                     config_json = gr.Textbox(label="JSON конфигурация", lines=3)
                     import_status = gr.Markdown("")
                     with gr.Row():
-                        debug_mode = gr.Checkbox(label="Debug Mode (Log Steps)", value=False)
-                        btn_clear_log = gr.Button("Clear Log")
-                    debug_output = gr.Textbox(label="Debug Log", interactive=False, lines=5)
+                        debug_mode = gr.Checkbox(label="Режим отладки (логировать шаги)", value=False)
+                        btn_clear_log = gr.Button("Очистить лог")
+                    debug_output = gr.Textbox(label="Лог последней генерации", interactive=False, lines=5)
 
             # --- Logic Connectors ---
             def _validate_params(d1_v, d2_v, s1_v, s2_v, down_v, up_v, keep1):
@@ -965,11 +977,10 @@ class KohyaHiresFix(scripts.Script):
                 # === HYBRID STEP LIMIT UPDATE ===
                 if use_one:
                     if use_old_onepass_logic:
-                        # OLD WAY: Обновляем ВСЕГДА, чтобы step_limit рос вместе с current
-                        # Это в точности копирует логику khrfix_olds (1).py
+                        # OLD WAY: Обновляем ВСЕГДА
                         self.step_limit = current
                     else:
-                        # NEW WAY: Ставим флаг "1" только когда эффект закончился
+                        # NEW WAY: Ставим флаг только в конце
                         if max_stop_s > 0 and current >= total * max_stop_s:
                             self.step_limit = 1
             
