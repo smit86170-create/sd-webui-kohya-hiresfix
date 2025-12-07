@@ -903,7 +903,7 @@ class KohyaHiresFix(scripts.Script):
 
                 pd = p.to_dict()
                 return (
-                    gr.update(value=pd.get("algo_mode", "Enhanced (RU+"))),      # algo_mode
+                    gr.update(value=pd.get("algo_mode", "Enhanced (RU+)")),      # algo_mode
                     gr.update(value=pd.get("d1", 3)),                            # d1
                     gr.update(value=pd.get("d2", 4)),                            # d2
                     gr.update(value=pd.get("depth_guard", True)),                # depth_guard
