@@ -1,19 +1,14 @@
-# kohya_hires_fix_unified_v2.5.3_ultimate.py
-# Версия: 2.5.3 (Ultimate: v19 Features + Old Math Fix)
+# kohya_hires_fix_unified_v2.6.0_refactor.py
+# SCRIPT_VERSION: 2.6.0 — именованный экспорт/импорт, новые кривые сглаживания, расширенная интерполяция и безопасность размеров.
 # Совместимость: A1111 / modules.scripts API, PyTorch >= 1.12
-#
-# Изменения:
-# - В основе лежит код версии 2.5.1 (v19) со всеми проверками безопасности и логами.
-# - Внедрена логика "Старой математики" (float vs int) для резкости.
-# - Внедрена логика "Старого одного прохода" (step vs flag).
-# - Добавлены настройки совместимости в UI.
+# Изменения: обновлены пресеты/PNG-инфо, исправлен sequential-mode и добавлены новые режимы глубины.
 
 from __future__ import annotations
 
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import gradio as gr
 import torch
@@ -21,8 +16,163 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from modules import scripts, script_callbacks
 
+SCRIPT_VERSION = "2.6.0"
+
 CONFIG_PATH = Path(__file__).with_suffix(".yaml")
 PRESETS_PATH = Path(__file__).with_name(Path(__file__).stem + ".presets.yaml")
+
+CURVE_CHOICES: List[str] = [
+    "Constant",
+    "Linear Up",
+    "Linear Down",
+    "Cosine Up",
+    "Cosine Down",
+    "Half Cosine Up",
+    "Half Cosine Down",
+    "Power Up",
+    "Power Down",
+    "Linear Repeating",
+    "Cosine Repeating",
+    "Sawtooth",
+]
+
+INTERP_CHOICES: List[str] = [
+    "nearest",
+    "nearest-exact",
+    "bilinear",
+    "bicubic",
+    "area",
+    "lanczos",
+    "bilinear-antialiased",
+    "bicubic-antialiased",
+    "area-antialiased",
+]
+
+DEPTH_PAIR_CHOICES: List[str] = [
+    "Авто (по алгоритму)",
+    "Последовательно (как olds.py)",
+    "Обе глубины одновременно (max)",
+    "Обе глубины одновременно (min)",
+    "Обе глубины одновременно (sum)",
+    "Только d1",
+    "Только d2",
+]
+
+PARAM_KEYS: List[str] = [
+    "enable",
+    "simple_mode",
+    "algo_mode",
+    "only_one_pass_enh",
+    "only_one_pass_legacy",
+    "one_pass_mode",
+    "d1",
+    "d2",
+    "depth_guard",
+    "depth_clamp",
+    "depth_pair_mode",
+    "s1",
+    "s2",
+    "stop_preview_enabled",
+    "stop_preview_steps",
+    "scaler",
+    "downscale",
+    "upscale",
+    "smooth_scaling_enh",
+    "smooth_scaling_legacy",
+    "smoothing_mode",
+    "smoothing_curve",
+    "smoothing_curve_param",
+    "early_out",
+    "keep_unitary_product",
+    "align_corners_mode",
+    "recompute_scale_factor_mode",
+    "size_rounding_mode",
+    "resolution_choice",
+    "apply_resolution",
+    "adaptive_by_resolution",
+    "adaptive_profile",
+    "legacy_force_align_false",
+    "enhanced_safe_upscale_clamp",
+    "use_old_float_math",
+    "use_old_onepass_logic",
+]
+
+# Порядок старого массива параметров (до 2.6.0) для обратной совместимости
+OLD_PARAM_KEYS: List[str] = [
+    "enable",
+    "simple_mode",
+    "algo_mode",
+    "only_one_pass_enh",
+    "only_one_pass_legacy",
+    "one_pass_mode",
+    "d1",
+    "d2",
+    "depth_guard",
+    "depth_clamp",
+    "depth_pair_mode",
+    "s1",
+    "s2",
+    "stop_preview_enabled",
+    "stop_preview_steps",
+    "scaler",
+    "downscale",
+    "upscale",
+    "smooth_scaling_enh",
+    "smooth_scaling_legacy",
+    "smoothing_mode",
+    "smoothing_curve",
+    "early_out",
+    "keep_unitary_product",
+    "align_corners_mode",
+    "recompute_scale_factor_mode",
+    "resolution_choice",
+    "apply_resolution",
+    "adaptive_by_resolution",
+    "adaptive_profile",
+    "legacy_force_align_false",
+    "enhanced_safe_upscale_clamp",
+    "use_old_float_math",
+    "use_old_onepass_logic",
+]
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "enable": False,
+    "simple_mode": True,
+    "algo_mode": "Enhanced (RU+)",
+    "only_one_pass_enh": True,
+    "only_one_pass_legacy": True,
+    "one_pass_mode": "Авто (по алгоритму)",
+    "d1": 3,
+    "d2": 4,
+    "depth_guard": True,
+    "depth_clamp": True,
+    "depth_pair_mode": "Авто (по алгоритму)",
+    "s1": 0.15,
+    "s2": 0.30,
+    "stop_preview_enabled": False,
+    "stop_preview_steps": 30,
+    "scaler": "bicubic",
+    "downscale": 0.5,
+    "upscale": 2.0,
+    "smooth_scaling_enh": True,
+    "smooth_scaling_legacy": True,
+    "smoothing_mode": "Авто (по алгоритму)",
+    "smoothing_curve": "Linear Up",
+    "smoothing_curve_param": 2.0,
+    "early_out": False,
+    "keep_unitary_product": False,
+    "align_corners_mode": "False",
+    "recompute_scale_factor_mode": "False",
+    "size_rounding_mode": "round",
+    "resolution_choice": "— не применять —",
+    "apply_resolution": False,
+    "adaptive_by_resolution": True,
+    "adaptive_profile": "Сбалансированный",
+    "legacy_force_align_false": True,
+    "enhanced_safe_upscale_clamp": True,
+    "use_old_float_math": True,
+    "use_old_onepass_logic": True,
+}
 
 # ---- Предустановленные разрешения ----
 
@@ -56,6 +206,92 @@ def _safe_mode(mode: str) -> str:
     if mode in {"bicubic", "bilinear", "nearest"}:
         return mode
     return "bilinear"
+
+
+def pack_params(values_list: Iterable[Any]) -> Dict[str, Any]:
+    return dict(zip(PARAM_KEYS, values_list))
+
+
+def unpack_params(cfg: Any, defaults: Dict[str, Any]) -> List[Any]:
+    base = dict(DEFAULT_CONFIG)
+    base.update(defaults or {})
+
+    # Новый формат: dict с ключами
+    if isinstance(cfg, dict):
+        for k in PARAM_KEYS:
+            if k in cfg:
+                base[k] = cfg[k]
+    # Старый формат: список/кортеж по старому порядку
+    elif isinstance(cfg, (list, tuple)):
+        for k, v in zip(OLD_PARAM_KEYS, cfg):
+            if k in base:
+                base[k] = v
+
+    return [base.get(k) for k in PARAM_KEYS]
+
+
+def _normalize_curve_name(name: str) -> str:
+    n = (name or "").strip().lower()
+    if n.startswith("linear") or n.startswith("лин"):
+        return "Linear Up"
+    if n.startswith("smooth"):
+        return "Cosine Up"
+    if n in {"constant"}:
+        return "Constant"
+    for opt in CURVE_CHOICES:
+        if n == opt.lower():
+            return opt
+    return "Linear Up"
+
+
+def curve_progress(frac: float, curve: str, param: float) -> float:
+    f = max(0.0, min(1.0, float(frac)))
+    p = max(1e-3, float(param))
+    raw = (curve or "").strip().lower()
+    if "smooth" in raw:
+        return max(0.0, min(1.0, f * f * (3.0 - 2.0 * f)))
+    c = (_normalize_curve_name(curve) or "Linear Up").lower()
+
+    if c == "constant":
+        val = 1.0
+    elif c == "linear down":
+        val = 1.0 - f
+    elif c == "cosine up":
+        val = 0.5 - 0.5 * math.cos(math.pi * f)
+    elif c == "cosine down":
+        val = 0.5 + 0.5 * math.cos(math.pi * f)
+    elif c == "half cosine up":
+        val = 1.0 - math.cos(f)
+    elif c == "half cosine down":
+        val = math.cos(f)
+    elif c == "power up":
+        val = math.pow(f, p)
+    elif c == "power down":
+        val = 1.0 - math.pow(f, p)
+    elif c == "linear repeating":
+        portion = (f * p) % 1.0
+        val = 1.0 - abs(2.0 * portion - 1.0)
+    elif c == "cosine repeating":
+        val = math.cos(2.0 * math.pi * f * p) * 0.5 + 0.5
+    elif c == "sawtooth":
+        val = (f * p) % 1.0
+    else:  # Linear Up
+        val = f
+
+    return max(0.0, min(1.0, float(val)))
+
+
+def parse_interp(choice: str) -> Tuple[str, bool]:
+    val = (choice or "").strip().lower()
+    antialias = False
+    if val.endswith("-antialiased"):
+        antialias = True
+        val = val.replace("-antialiased", "")
+    if val == "lanczos":
+        return "lanczos", antialias
+    if val == "area":
+        return "area", antialias
+    return _safe_mode(val), antialias
 
 
 def _load_yaml(path: Path, default: dict) -> dict:
@@ -183,7 +419,8 @@ class HiresPreset:
         self.smooth_scaling_enh: bool = True
         self.smooth_scaling_legacy: bool = True
 
-        self.smoothing_curve: str = "Линейная"
+        self.smoothing_curve: str = "Linear Up"
+        self.smoothing_curve_param: float = 2.0
 
         self.early_out: bool = False
 
@@ -199,6 +436,7 @@ class HiresPreset:
         self.recompute_scale_factor_mode: str = "False"
         self.smoothing_mode: str = "Авто (по алгоритму)"
         self.one_pass_mode: str = "Авто (по алгоритму)"
+        self.size_rounding_mode: str = "round"
 
         self.resolution_choice: str = RESOLUTION_CHOICES[0]
         self.apply_resolution: bool = False
@@ -226,6 +464,15 @@ class HiresPreset:
             self.only_one_pass_enh = bool(legacy_one)
             self.only_one_pass_legacy = bool(legacy_one)
 
+        # Normalize new fields
+        self.smoothing_curve = _normalize_curve_name(self.smoothing_curve)
+        try:
+            self.smoothing_curve_param = float(self.smoothing_curve_param)
+        except Exception:
+            self.smoothing_curve_param = 2.0
+        if self.size_rounding_mode not in {"round", "floor", "ceil"}:
+            self.size_rounding_mode = "round"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "category": self.category,
@@ -240,6 +487,7 @@ class HiresPreset:
             "smooth_scaling_enh": self.smooth_scaling_enh,
             "smooth_scaling_legacy": self.smooth_scaling_legacy,
             "smoothing_curve": self.smoothing_curve,
+            "smoothing_curve_param": self.smoothing_curve_param,
             "early_out": self.early_out,
             "only_one_pass_enh": self.only_one_pass_enh,
             "only_one_pass_legacy": self.only_one_pass_legacy,
@@ -251,6 +499,7 @@ class HiresPreset:
             "recompute_scale_factor_mode": self.recompute_scale_factor_mode,
             "smoothing_mode": self.smoothing_mode,
             "one_pass_mode": self.one_pass_mode,
+            "size_rounding_mode": self.size_rounding_mode,
             "resolution_choice": self.resolution_choice,
             "apply_resolution": self.apply_resolution,
             "adaptive_by_resolution": self.adaptive_by_resolution,
@@ -282,7 +531,8 @@ DEFAULT_PRESETS: Dict[str, Dict[str, Any]] = {
         "upscale": 1.8,
         "smooth_scaling_enh": True,
         "smooth_scaling_legacy": True,
-        "smoothing_curve": "Smoothstep",
+        "smoothing_curve": "Cosine Up",
+        "smoothing_curve_param": 2.0,
         "early_out": False,
         "only_one_pass_enh": True,
         "only_one_pass_legacy": True,
@@ -307,6 +557,8 @@ DEFAULT_PRESETS: Dict[str, Dict[str, Any]] = {
         "upscale": 2.0,
         "smooth_scaling_enh": True,
         "smooth_scaling_legacy": True,
+        "smoothing_curve": "Linear Up",
+        "smoothing_curve_param": 2.0,
         "early_out": False,
         "only_one_pass_enh": True,
         "only_one_pass_legacy": True,
@@ -382,14 +634,16 @@ class Scaler(torch.nn.Module):
         align_mode: str = "false",
         recompute_mode: str = "false",
         use_old_float_math: bool = True,  # 🆕 ФЛАГ
+        size_rounding_mode: str = "round",
     ) -> None:
         super().__init__()
         self.scale: float = float(scale)
         self.block: torch.nn.Module = block
-        self.scaler: str = _safe_mode(scaler)
+        self.scaler: str = str(scaler)
         self.align_mode: str = _norm_mode_choice(align_mode, "false")
         self.recompute_mode: str = _norm_mode_choice(recompute_mode, "false")
         self.use_old_float_math: bool = use_old_float_math # 🆕
+        self.size_rounding_mode: str = size_rounding_mode if size_rounding_mode in {"round", "floor", "ceil"} else "round"
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if self.scale == 1.0:
@@ -410,27 +664,61 @@ class Scaler(torch.nn.Module):
         elif self.recompute_mode == "false":
             recompute_scale_factor = False
 
+        interp_mode, antialias = parse_interp(self.scaler)
+        fallback_mode = None
+        if interp_mode == "lanczos":
+            fallback_mode = "bicubic"
+            interp_mode = "bicubic"
+            antialias = True
+
+        def _apply_interp(inp: torch.Tensor, **interp_kwargs):
+            try:
+                if "antialias" in F.interpolate.__code__.co_varnames:
+                    return F.interpolate(inp, antialias=bool(antialias), **interp_kwargs)
+                return F.interpolate(inp, **interp_kwargs)
+            except TypeError:
+                return F.interpolate(inp, **{k: v for k, v in interp_kwargs.items() if k != "antialias"})
+            except Exception:
+                if fallback_mode and interp_kwargs.get("mode") != fallback_mode:
+                    interp_kwargs["mode"] = fallback_mode
+                    return _apply_interp(inp, **interp_kwargs)
+                raise
+
         # 🆕 ГИБРИДНАЯ ЛОГИКА
         if self.use_old_float_math:
             # ✅ OLD (Legacy) - Прямая передача float, без округления размеров
-            x_scaled = F.interpolate(
+            eff_mode = interp_mode
+            if eff_mode == "area" and self.scale > 1.0:
+                eff_mode = "bilinear"
+            x_scaled = _apply_interp(
                 x,
                 scale_factor=self.scale,
-                mode=self.scaler,
+                mode=eff_mode,
                 align_corners=align_corners,
                 recompute_scale_factor=recompute_scale_factor,
             )
         else:
             # ✅ NEW (Safe) - Округление до целых пикселей
             h, w = x.shape[-2:]
-            new_h = max(1, int(h * self.scale))
-            new_w = max(1, int(w * self.scale))
+            if self.size_rounding_mode == "floor":
+                round_fn = math.floor
+            elif self.size_rounding_mode == "ceil":
+                round_fn = math.ceil
+            else:
+                round_fn = round
+
+            new_h = max(1, int(round_fn(h * self.scale)))
+            new_w = max(1, int(round_fn(w * self.scale)))
             scale_factor = (new_h / h, new_w / w)
-            
-            x_scaled = F.interpolate(
+
+            eff_mode = interp_mode
+            if eff_mode == "area" and (new_h > h or new_w > w):
+                eff_mode = "bilinear"
+
+            x_scaled = _apply_interp(
                 x,
                 scale_factor=scale_factor,
-                mode=self.scaler,
+                mode=eff_mode,
                 align_corners=align_corners,
                 recompute_scale_factor=recompute_scale_factor,
             )
@@ -502,50 +790,62 @@ class KohyaHiresFix(scripts.Script):
         self.infotext_fields = []
         pm = PresetManager()
         cfg = self.config
+        cfg_dict = {}
+        try:
+            cfg_dict = OmegaConf.to_container(cfg, resolve=True) or {}
+        except Exception:
+            cfg_dict = dict(cfg) if isinstance(cfg, dict) else {}
+        base_cfg = dict(DEFAULT_CONFIG)
+        if isinstance(cfg_dict, dict):
+            base_cfg.update(cfg_dict)
 
         # Load defaults (с поддержкой новых флагов)
-        last_algo_mode = cfg.get("algo_mode", "Enhanced (RU+)")
-        last_resolution_choice = cfg.get("resolution_choice", RESOLUTION_CHOICES[0])
-        last_apply_resolution = cfg.get("apply_resolution", False)
-        last_adaptive_by_resolution = cfg.get("adaptive_by_resolution", True)
-        last_adaptive_profile = cfg.get("adaptive_profile", "Сбалансированный")
+        last_algo_mode = base_cfg.get("algo_mode", "Enhanced (RU+)")
+        last_resolution_choice = base_cfg.get("resolution_choice", RESOLUTION_CHOICES[0])
+        last_apply_resolution = base_cfg.get("apply_resolution", False)
+        last_adaptive_by_resolution = base_cfg.get("adaptive_by_resolution", True)
+        last_adaptive_profile = base_cfg.get("adaptive_profile", "Сбалансированный")
         
-        last_s1 = float(cfg.get("s1", 0.15))
-        last_s2 = float(cfg.get("s2", 0.30))
-        last_d1 = int(cfg.get("d1", 3))
-        last_d2 = int(cfg.get("d2", 4))
-        last_scaler = cfg.get("scaler", "bicubic")
-        last_downscale = float(cfg.get("downscale", 0.5))
-        last_upscale = float(cfg.get("upscale", 2.0))
+        last_s1 = float(base_cfg.get("s1", 0.15))
+        last_s2 = float(base_cfg.get("s2", 0.30))
+        last_d1 = int(base_cfg.get("d1", 3))
+        last_d2 = int(base_cfg.get("d2", 4))
+        last_scaler = base_cfg.get("scaler", "bicubic")
+        last_downscale = float(base_cfg.get("downscale", 0.5))
+        last_upscale = float(base_cfg.get("upscale", 2.0))
         
         # ФЛАГИ ПО УМОЛЧАНИЮ = True (OLD Logic)
-        last_use_old_float_math = cfg.get("use_old_float_math", True) 
-        last_use_old_onepass_logic = cfg.get("use_old_onepass_logic", True) 
-        last_legacy_force_align_false = cfg.get("legacy_force_align_false", True)
-        last_enh_safe_clamp = cfg.get("enhanced_safe_upscale_clamp", True)
+        last_use_old_float_math = base_cfg.get("use_old_float_math", True) 
+        last_use_old_onepass_logic = base_cfg.get("use_old_onepass_logic", True) 
+        last_legacy_force_align_false = base_cfg.get("legacy_force_align_false", True)
+        last_enh_safe_clamp = base_cfg.get("enhanced_safe_upscale_clamp", True)
+        last_size_rounding_mode = base_cfg.get("size_rounding_mode", "round")
 
         # Legacy fallback logic
-        legacy_smooth = cfg.get("smooth_scaling", None)
-        last_smooth_enh = bool(legacy_smooth) if legacy_smooth is not None else cfg.get("smooth_scaling_enh", True)
-        last_smooth_leg = bool(legacy_smooth) if legacy_smooth is not None else cfg.get("smooth_scaling_legacy", True)
+        legacy_smooth = base_cfg.get("smooth_scaling", None)
+        last_smooth_enh = bool(legacy_smooth) if legacy_smooth is not None else base_cfg.get("smooth_scaling_enh", True)
+        last_smooth_leg = bool(legacy_smooth) if legacy_smooth is not None else base_cfg.get("smooth_scaling_legacy", True)
         
-        legacy_one = cfg.get("only_one_pass", None)
-        last_only_enh = bool(legacy_one) if legacy_one is not None else cfg.get("only_one_pass_enh", True)
-        last_only_leg = bool(legacy_one) if legacy_one is not None else cfg.get("only_one_pass_legacy", True)
+        legacy_one = base_cfg.get("only_one_pass", None)
+        last_only_enh = bool(legacy_one) if legacy_one is not None else base_cfg.get("only_one_pass_enh", True)
+        last_only_leg = bool(legacy_one) if legacy_one is not None else base_cfg.get("only_one_pass_legacy", True)
         
-        last_depth_guard = cfg.get("depth_guard", True)
-        last_depth_clamp = cfg.get("depth_clamp", True)                  # 🆕
-        last_depth_pair_mode = cfg.get("depth_pair_mode", "Авто (по алгоритму)")  # 🆕
-        last_smoothing_curve = cfg.get("smoothing_curve", "Линейная")
-        last_early_out = cfg.get("early_out", False)
-        last_keep1 = cfg.get("keep_unitary_product", False)
-        last_align_mode = cfg.get("align_corners_mode", "False")
-        last_recompute_mode = cfg.get("recompute_scale_factor_mode", "False")
-        last_smoothing_mode = cfg.get("smoothing_mode", "Авто (по алгоритму)")
-        last_one_pass_mode = cfg.get("one_pass_mode", "Авто (по алгоритму)")
-        last_simple_mode = cfg.get("simple_mode", True)
-        last_stop_preview_enabled = cfg.get("stop_preview_enabled", False)
-        last_stop_preview_steps = int(cfg.get("stop_preview_steps", 30))
+        last_depth_guard = base_cfg.get("depth_guard", True)
+        last_depth_clamp = base_cfg.get("depth_clamp", True)                  # 🆕
+        last_depth_pair_mode = base_cfg.get("depth_pair_mode", "Авто (по алгоритму)")  # 🆕
+        if last_depth_pair_mode not in DEPTH_PAIR_CHOICES:
+            last_depth_pair_mode = DEPTH_PAIR_CHOICES[0]
+        last_smoothing_curve = _normalize_curve_name(base_cfg.get("smoothing_curve", "Linear Up"))
+        last_smoothing_curve_param = float(base_cfg.get("smoothing_curve_param", 2.0))
+        last_early_out = base_cfg.get("early_out", False)
+        last_keep1 = base_cfg.get("keep_unitary_product", False)
+        last_align_mode = base_cfg.get("align_corners_mode", "False")
+        last_recompute_mode = base_cfg.get("recompute_scale_factor_mode", "False")
+        last_smoothing_mode = base_cfg.get("smoothing_mode", "Авто (по алгоритму)")
+        last_one_pass_mode = base_cfg.get("one_pass_mode", "Авто (по алгоритму)")
+        last_simple_mode = base_cfg.get("simple_mode", True)
+        last_stop_preview_enabled = base_cfg.get("stop_preview_enabled", False)
+        last_stop_preview_steps = int(base_cfg.get("stop_preview_steps", 30))
 
         is_enhanced = (last_algo_mode == "Enhanced (RU+)")
 
@@ -626,9 +926,14 @@ class KohyaHiresFix(scripts.Script):
                         value=last_enh_safe_clamp,
                         info="При включении ограничивает Upscale (1–4). При выключении ведёт себя как Legacy/olds."
                     )
+                    size_rounding_mode = gr.Dropdown(
+                        choices=["round", "floor", "ceil"],
+                        value=last_size_rounding_mode if last_size_rounding_mode in {"round", "floor", "ceil"} else "round",
+                        label="Округление размеров (NEW math)"
+                    )
 
                 with gr.Row():
-                    scaler = gr.Dropdown(choices=["bicubic", "bilinear", "nearest", "nearest-exact"], label="Интерполяция", value=last_scaler)
+                    scaler = gr.Dropdown(choices=INTERP_CHOICES, label="Интерполяция", value=last_scaler if last_scaler in INTERP_CHOICES else "bicubic")
                     downscale = gr.Slider(0.1, 1.0, step=0.05, label="Downscale", value=last_downscale)
                     upscale = gr.Slider(1.0, 4.0, step=0.1, label="Upscale", value=last_upscale)
 
@@ -682,7 +987,8 @@ class KohyaHiresFix(scripts.Script):
                             label="Логика сглаживания",
                             info="Авто: берёт Enh/Leg в зависимости от выбранного алгоритма. Остальные пункты принудительно включают соответствующий флаг независимо от алгоритма."
                         )
-                        smoothing_curve = gr.Dropdown(choices=["Линейная", "Smoothstep"], value=last_smoothing_curve, label="Кривая", visible=is_enhanced)
+                        smoothing_curve = gr.Dropdown(choices=CURVE_CHOICES, value=last_smoothing_curve, label="Кривая", visible=is_enhanced)
+                        smoothing_curve_param = gr.Slider(0.25, 16.0, step=0.05, value=last_smoothing_curve_param, label="Curve param (power/repeats)", visible=is_enhanced)
                         keep_unitary_product = gr.Checkbox(label="Сохранять масштаб=1", value=last_keep1, visible=is_enhanced)
                     with gr.Row():
                         resolution_choice = gr.Dropdown(choices=RESOLUTION_CHOICES, value=last_resolution_choice, label="Разрешение")
@@ -698,19 +1004,13 @@ class KohyaHiresFix(scripts.Script):
                             label="Профиль",
                             visible=last_adaptive_by_resolution,
                         )
-                        depth_pair_mode = gr.Dropdown(              # 🆕 новый дропдаун
-                        choices=[
-                            "Авто (по алгоритму)",
-                            "Последовательно (как olds.py)",
-                            "Обе глубины одновременно",
-                            "Только d1",
-                            "Только d2",
-                        ],
-                        value=last_depth_pair_mode,
-                        label="Режим обработки depth-пар",
-                        info="Авто: Legacy → как в olds.py (по очереди и return), Enhanced → оба depth одновременно (как сейчас). "
-                             "Остальные режимы принудительно задают поведение независимо от алгоритма."
-                    )
+                        depth_pair_mode = gr.Dropdown(
+                            choices=DEPTH_PAIR_CHOICES,
+                            value=last_depth_pair_mode if last_depth_pair_mode in DEPTH_PAIR_CHOICES else DEPTH_PAIR_CHOICES[0],
+                            label="Режим обработки depth-пар",
+                            info="Авто: Legacy → как в olds.py (по очереди и return), Enhanced → оба depth одновременно (как сейчас). "
+                                 "Остальные режимы принудительно задают поведение независимо от алгоритма."
+                        )
 
                 with gr.Group():
                     gr.Markdown("**Интерполяция (Advanced)**")
@@ -792,9 +1092,16 @@ class KohyaHiresFix(scripts.Script):
 
             def _toggle_algo_vis(mode):
                 is_enh = (mode == "Enhanced (RU+)")
-                return (gr.update(visible=is_enh), gr.update(visible=not is_enh), gr.update(visible=is_enh),
-                        gr.update(visible=is_enh), gr.update(visible=is_enh), gr.update(visible=is_enh))
-            algo_mode.change(_toggle_algo_vis, inputs=[algo_mode], outputs=[smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, keep_unitary_product, only_one_pass_enh, only_one_pass_legacy])
+                return (
+                    gr.update(visible=is_enh),
+                    gr.update(visible=not is_enh),
+                    gr.update(visible=is_enh),
+                    gr.update(visible=is_enh),
+                    gr.update(visible=is_enh),
+                    gr.update(visible=is_enh),
+                    gr.update(visible=is_enh),
+                )
+            algo_mode.change(_toggle_algo_vis, inputs=[algo_mode], outputs=[smooth_scaling_enh, smooth_scaling_legacy, smoothing_curve, smoothing_curve_param, keep_unitary_product, only_one_pass_enh, only_one_pass_legacy])
 
             def _toggle_adaptive(adapt_enabled):
                 # Профиль имеет смысл только когда адаптация включена
@@ -834,17 +1141,7 @@ class KohyaHiresFix(scripts.Script):
             btn_quick_aggressive.click(lambda: _apply_quick_preset("aggressive"), outputs=[s1, s2, d1, d2, downscale, upscale])
 
             # --- Save/Load Presets (FULL LOGIC RESTORED) ---
-            def _save_preset_cb(
-                name, cat_in, cat_filt,
-                mode, d1_v, d2_v, depth_guard_v, depth_clamp_v, depth_pair_mode_v,
-                s1_v, s2_v, scl, dw, up,
-                sm_enh, sm_leg, sm_sel, sm_c, eo,
-                one_enh, one_leg, one_sel,
-                k1, al, rc,
-                res, app, ad, ad_p,
-                legacy_align_false, enh_safe_clamp,
-                old_math, old_one
-            ):
+            def _save_preset_cb(name, cat_in, cat_filt, *params):
                 name = (name or "").strip()
                 if not name:
                     return gr.update(), gr.update(), "⚠️ Имя?"
@@ -852,39 +1149,8 @@ class KohyaHiresFix(scripts.Script):
                 cat = (cat_in or "").strip() or (cat_filt if cat_filt != "Все" else "Общие")
 
                 base = HiresPreset().to_dict()
-                base.update({
-                    "category": cat,
-                    "algo_mode": mode,
-                    "d1": int(d1_v),
-                    "d2": int(d2_v),
-                    "depth_guard": bool(depth_guard_v),
-                    "depth_clamp": bool(depth_clamp_v),
-                    "depth_pair_mode": str(depth_pair_mode_v),
-                    "s1": float(s1_v),
-                    "s2": float(s2_v),
-                    "scaler": str(scl),
-                    "downscale": float(dw),
-                    "upscale": float(up),
-                    "smooth_scaling_enh": bool(sm_enh),
-                    "smooth_scaling_legacy": bool(sm_leg),
-                    "smoothing_mode": str(sm_sel),
-                    "smoothing_curve": str(sm_c),
-                    "early_out": bool(eo),
-                    "only_one_pass_enh": bool(one_enh),
-                    "only_one_pass_legacy": bool(one_leg),
-                    "one_pass_mode": str(one_sel),
-                    "keep_unitary_product": bool(k1),
-                    "align_corners_mode": str(al),
-                    "recompute_scale_factor_mode": str(rc),
-                    "resolution_choice": str(res),
-                    "apply_resolution": bool(app),
-                    "adaptive_by_resolution": bool(ad),
-                    "adaptive_profile": str(ad_p),
-                    "legacy_force_align_false": bool(legacy_align_false),
-                    "enhanced_safe_upscale_clamp": bool(enh_safe_clamp),
-                    "use_old_float_math": bool(old_math),
-                    "use_old_onepass_logic": bool(old_one),
-                })
+                base.update(pack_params(params))
+                base["category"] = cat
                 pm.upsert(name, HiresPreset(**base))
                 cats = ["Все"] + pm.categories()
                 return (
@@ -893,51 +1159,18 @@ class KohyaHiresFix(scripts.Script):
                     f"✅ Сохранён «{name}»."
                 )
             
-            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter, algo_mode, d1, d2, depth_guard, depth_clamp, depth_pair_mode, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, legacy_force_align_false, enhanced_safe_clamp, use_old_float_math, use_old_onepass_logic], outputs=[preset_category_filter, preset_select, preset_status])
+            # wiring happens after all_params_list is constructed
             
             def _load_preset_cb(name):
                 p = pm.get(name)
                 if not p:
-                    # 31 gr.update() для всех контролов + строка в preset_status
-                    return (*[gr.update()]*31, "❌ Пресет не найден")
+                    return (*[gr.update()] * len(PARAM_KEYS), gr.update(), gr.update(value="❌ Пресет не найден"))
 
                 pd = p.to_dict()
-                return (
-                    gr.update(value=pd.get("algo_mode", "Enhanced (RU+)")),      # algo_mode
-                    gr.update(value=pd.get("d1", 3)),                            # d1
-                    gr.update(value=pd.get("d2", 4)),                            # d2
-                    gr.update(value=pd.get("depth_guard", True)),                # depth_guard
-                    gr.update(value=pd.get("depth_clamp", True)),                # depth_clamp
-                    gr.update(value=pd.get("depth_pair_mode", "Авто (по алгоритму)")),
-                    gr.update(value=pd.get("s1", 0.15)),                         # s1
-                    gr.update(value=pd.get("s2", 0.30)),                         # s2
-                    gr.update(value=pd.get("scaler", "bicubic")),                # scaler
-                    gr.update(value=pd.get("downscale", 0.5)),                   # downscale
-                    gr.update(value=pd.get("upscale", 2.0)),                     # upscale
-                    gr.update(value=pd.get("smooth_scaling_enh", True)),
-                    gr.update(value=pd.get("smooth_scaling_legacy", True)),
-                    gr.update(value=pd.get("smoothing_mode", "Авто (по алгоритму)")),
-                    gr.update(value=pd.get("smoothing_curve", "Линейная")),
-                    gr.update(value=pd.get("early_out", False)),
-                    gr.update(value=pd.get("only_one_pass_enh", True)),
-                    gr.update(value=pd.get("only_one_pass_legacy", True)),
-                    gr.update(value=pd.get("one_pass_mode", "Авто (по алгоритму)")),
-                    gr.update(value=pd.get("keep_unitary_product", False)),
-                    gr.update(value=pd.get("align_corners_mode", "False")),
-                    gr.update(value=pd.get("recompute_scale_factor_mode", "False")),
-                    gr.update(value=pd.get("resolution_choice", RESOLUTION_CHOICES[0])),
-                    gr.update(value=pd.get("apply_resolution", False)),
-                    gr.update(value=pd.get("adaptive_by_resolution", True)),
-                    gr.update(value=pd.get("adaptive_profile", "Сбалансированный")),
-                    gr.update(value=pd.get("legacy_force_align_false", True)),
-                    gr.update(value=pd.get("enhanced_safe_upscale_clamp", True)),
-                    gr.update(value=pd.get("use_old_float_math", True)),
-                    gr.update(value=pd.get("use_old_onepass_logic", True)),
-                    gr.update(value=name),                       # preset_name
-                    gr.update(value="✅ Loaded"),                # preset_status
-                )
-            
-            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=[algo_mode, d1, d2, depth_guard, depth_clamp, depth_pair_mode, s1, s2, scaler, downscale, upscale, smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select, keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice, apply_resolution, adaptive_by_resolution, adaptive_profile, legacy_force_align_false, enhanced_safe_clamp, use_old_float_math, use_old_onepass_logic, preset_name, preset_status])
+                values = unpack_params(pd, DEFAULT_CONFIG)
+                updates = [gr.update(value=v) for v in values]
+                updates.extend([gr.update(value=name), gr.update(value="✅ Loaded")])
+                return tuple(updates)
             
             def _delete_preset_cb(name, cat_filt):
                 pm.delete(name)
@@ -953,108 +1186,44 @@ class KohyaHiresFix(scripts.Script):
 
             # --- Export/Import Logic (FULL LOGIC RESTORED) ---
             def _export_all_config(*params):
-                config = {
-                    "version": "2.5.3",
-                    "enable": params[0],
-                    "simple_mode": params[1],
-                    "algo_mode": params[2],
-                    "only_one_pass_enh": params[3],
-                    "only_one_pass_legacy": params[4],
-                    "one_pass_mode": params[5],
-                    "d1": params[6],
-                    "d2": params[7],
-                    "depth_guard": params[8],
-                    "depth_clamp": params[9],
-                    "depth_pair_mode": params[10],
-                    "s1": params[11],
-                    "s2": params[12],
-                    "stop_preview_enabled": params[13],
-                    "stop_preview_steps": params[14],
-                    "scaler": params[15],
-                    "downscale": params[16],
-                    "upscale": params[17],
-                    "smooth_scaling_enh": params[18],
-                    "smooth_scaling_legacy": params[19],
-                    "smoothing_mode": params[20],
-                    "smoothing_curve": params[21],
-                    "early_out": params[22],
-                    "keep_unitary_product": params[23],
-                    "align_corners_mode": params[24],
-                    "recompute_scale_factor_mode": params[25],
-                    "resolution_choice": params[26],
-                    "apply_resolution": params[27],
-                    "adaptive_by_resolution": params[28],
-                    "adaptive_profile": params[29],
-                    "legacy_force_align_false": params[30],
-                    "enhanced_safe_upscale_clamp": params[31],
-                    "use_old_float_math": params[32],
-                    "use_old_onepass_logic": params[33],
-                }
+                config = pack_params(params)
+                config["__version__"] = SCRIPT_VERSION
+                config["version"] = SCRIPT_VERSION
                 return json.dumps(config, indent=2, ensure_ascii=False)
 
             def _import_all_config(json_str):
                 try:
-                    config = json.loads(json_str)
-
-                    return (
-                        gr.update(value=config.get("enable", False)),                      # 0 enable
-                        gr.update(value=config.get("simple_mode", True)),                 # 1 simple_mode
-                        gr.update(value=config.get("algo_mode", "Enhanced (RU+)")),       # 2 algo_mode
-                        gr.update(value=config.get("only_one_pass_enh", True)),           # 3 only_one_pass_enh
-                        gr.update(value=config.get("only_one_pass_legacy", True)),        # 4 only_one_pass_legacy
-                        gr.update(value=config.get("one_pass_mode", "Авто (по алгоритму)")),  # 5 one_pass_mode_select
-                        gr.update(value=config.get("d1", 3)),                             # 6 d1
-                        gr.update(value=config.get("d2", 4)),                             # 7 d2
-                        gr.update(value=config.get("depth_guard", True)),                 # 8 depth_guard
-                        gr.update(value=config.get("depth_clamp", True)),                 # 9 depth_clamp
-                        gr.update(value=config.get("depth_pair_mode", "Авто (по алгоритму)")),  # 10 depth_pair_mode
-                        gr.update(value=config.get("s1", 0.15)),                          # 11 s1
-                        gr.update(value=config.get("s2", 0.30)),                          # 12 s2
-                        gr.update(value=config.get("stop_preview_enabled", False)),       # 13 stop_preview_enabled
-                        gr.update(value=int(config.get("stop_preview_steps", 30))),       # 14 stop_preview_steps
-                        gr.update(value=config.get("scaler", "bicubic")),                 # 15 scaler
-                        gr.update(value=config.get("downscale", 0.5)),                    # 16 downscale
-                        gr.update(value=config.get("upscale", 2.0)),                      # 17 upscale
-                        gr.update(value=config.get("smooth_scaling_enh", True)),          # 18 smooth_scaling_enh
-                        gr.update(value=config.get("smooth_scaling_legacy", True)),       # 19 smooth_scaling_legacy
-                        gr.update(value=config.get("smoothing_mode", "Авто (по алгоритму)")),  # 20 smoothing_mode_select
-                        gr.update(value=config.get("smoothing_curve", "Линейная")),       # 21 smoothing_curve
-                        gr.update(value=config.get("early_out", False)),                  # 22 early_out
-                        gr.update(value=config.get("keep_unitary_product", False)),       # 23 keep_unitary_product
-                        gr.update(value=config.get("align_corners_mode", "False")),       # 24 align_corners_mode
-                        gr.update(value=config.get("recompute_scale_factor_mode", "False")), # 25 recompute_scale_factor_mode
-                        gr.update(value=config.get("resolution_choice", RESOLUTION_CHOICES[0])), # 26 resolution_choice
-                        gr.update(value=config.get("apply_resolution", False)),           # 27 apply_resolution
-                        gr.update(value=config.get("adaptive_by_resolution", True)),      # 28 adaptive_by_resolution
-                        gr.update(value=config.get("adaptive_profile", "Сбалансированный")), # 29 adaptive_profile
-                        gr.update(value=config.get("legacy_force_align_false", True)),    # 30 legacy_force_align_false
-                        gr.update(value=config.get("enhanced_safe_upscale_clamp", True)), # 31 enhanced_safe_clamp
-                        gr.update(value=config.get("use_old_float_math", True)),          # 32 use_old_float_math
-                        gr.update(value=config.get("use_old_onepass_logic", True)),       # 33 use_old_onepass_logic
-                        "✅ Настройки импортированы",                                     # 34 import_status
-                    )
+                    loaded = json.loads(json_str)
+                    config_obj: Dict[str, Any]
+                    if isinstance(loaded, dict):
+                        config_obj = {k: v for k, v in loaded.items() if not str(k).startswith("__")}
+                    else:
+                        config_obj = loaded
+                    values = unpack_params(config_obj, DEFAULT_CONFIG)
+                    return (*[gr.update(value=v) for v in values], "✅ Настройки импортированы")
                 except Exception as e:
-                    return (
-                        *[gr.update()]*34,
-                        f"❌ Ошибка: {e}",
-                    )
+                    return (*[gr.update()]*len(PARAM_KEYS), f"❌ Ошибка: {e}")
 
             all_params_list = [
                 enable, simple_mode, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
                 d1, d2, depth_guard, depth_clamp, depth_pair_mode, s1, s2, stop_preview_toggle, stop_preview_steps, scaler, downscale, upscale,
-                smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
-                keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, resolution_choice,
+                smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, smoothing_curve_param, early_out,
+                keep_unitary_product, align_corners_mode, recompute_scale_factor_mode, size_rounding_mode, resolution_choice,
                 apply_resolution, adaptive_by_resolution, adaptive_profile, legacy_force_align_false, enhanced_safe_clamp,
                 use_old_float_math, use_old_onepass_logic
             ]
 
+            btn_save.click(_save_preset_cb, inputs=[preset_name, preset_category_input, preset_category_filter] + all_params_list, outputs=[preset_category_filter, preset_select, preset_status])
+            btn_load.click(_load_preset_cb, inputs=[preset_select], outputs=all_params_list + [preset_name, preset_status])
             btn_export_config.click(_export_all_config, inputs=all_params_list, outputs=[config_json])
             btn_import_config.click(_import_all_config, inputs=[config_json], outputs=all_params_list + [import_status])
 
         self.infotext_fields.append((enable, "DSHF_enabled"))
         for k, el in {
             "DSHF_mode": algo_mode, "DSHF_s1": s1, "DSHF_d1": d1, "DSHF_s2": s2, "DSHF_d2": d2,
-            "DSHF_scaler": scaler, "DSHF_down": downscale, "DSHF_up": upscale, "DSHF_old_float": use_old_float_math
+            "DSHF_scaler": scaler, "DSHF_down": downscale, "DSHF_up": upscale, "DSHF_old_float": use_old_float_math,
+            "DSHF_curve": smoothing_curve, "DSHF_curve_param": smoothing_curve_param,
+            "DSHF_interp": scaler, "DSHF_rounding": size_rounding_mode, "DSHF_depth_pair_mode": depth_pair_mode,
         }.items():
             self.infotext_fields.append((el, k))
 
@@ -1063,8 +1232,8 @@ class KohyaHiresFix(scripts.Script):
     def process(
         self, p, enable, simple, algo_mode, only_one_pass_enh, only_one_pass_legacy, one_pass_mode_select,
         d1, d2, depth_guard, depth_clamp, depth_pair_mode, s1, s2, stop_preview_enabled, stop_preview_steps, scaler, downscale, upscale,
-        smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, early_out,
-        keep_unitary_product, align_ui, recompute_ui, res_choice, apply_res,
+        smooth_scaling_enh, smooth_scaling_legacy, smoothing_mode_select, smoothing_curve, smoothing_curve_param, early_out,
+        keep_unitary_product, align_ui, recompute_ui, size_rounding_mode, res_choice, apply_res,
         adapt, adapt_prof, legacy_force_align_false, enhanced_safe_clamp,
         use_old_float_math, use_old_onepass_logic, # 🆕 HYBRID FLAGS
         debug_mode_val
@@ -1091,6 +1260,7 @@ class KohyaHiresFix(scripts.Script):
             "smooth_scaling_legacy": smooth_scaling_legacy,
             "smoothing_mode": smoothing_mode_select,
             "smoothing_curve": smoothing_curve,
+            "smoothing_curve_param": smoothing_curve_param,
             "early_out": early_out,
             "only_one_pass_enh": only_one_pass_enh,
             "only_one_pass_legacy": only_one_pass_legacy,
@@ -1098,6 +1268,7 @@ class KohyaHiresFix(scripts.Script):
             "keep_unitary_product": keep_unitary_product,
             "align_corners_mode": align_ui,
             "recompute_scale_factor_mode": recompute_ui,
+            "size_rounding_mode": size_rounding_mode,
             "resolution_choice": res_choice,
             "apply_resolution": apply_res,
             "adaptive_by_resolution": adapt,
@@ -1149,7 +1320,7 @@ class KohyaHiresFix(scripts.Script):
 
         d1_idx = int(use_d1) - 1
         d2_idx = int(use_d2) - 1
-        scaler_mode = _safe_mode(scaler)
+        scaler_mode = str(scaler)
 
         if algo_mode == "Legacy (Original)" and legacy_force_align_false:
             # Строгий Legacy: как в старом скрипте — всегда False/False
@@ -1158,6 +1329,8 @@ class KohyaHiresFix(scripts.Script):
             # Во всех остальных случаях — читаем из UI
             align_mode = _norm_mode_choice(align_ui, "auto")
             recompute_mode = _norm_mode_choice(recompute_ui, "auto")
+
+        size_rounding_mode = size_rounding_mode if size_rounding_mode in {"round", "floor", "ceil"} else "round"
 
         # Select logic
         def _select_cross_mode(choice: str, enh_value: bool, legacy_value: bool) -> bool:
@@ -1168,6 +1341,11 @@ class KohyaHiresFix(scripts.Script):
 
         use_smooth = _select_cross_mode(smoothing_mode_select, smooth_scaling_enh, smooth_scaling_legacy)
         use_one = _select_cross_mode(one_pass_mode_select, only_one_pass_enh, only_one_pass_legacy)
+        smoothing_curve = _normalize_curve_name(smoothing_curve)
+        try:
+            smoothing_curve_param = float(smoothing_curve_param)
+        except Exception:
+            smoothing_curve_param = DEFAULT_CONFIG["smoothing_curve_param"]
 
         # 🛡️ DEPTH GUARD & MAPPING LOGIC
         mapping_notes = []
@@ -1206,6 +1384,12 @@ class KohyaHiresFix(scripts.Script):
                 return "sequential" if algo_mode == "Legacy (Original)" else "both"
             if "послед" in ms:
                 return "sequential"
+            if "sum" in ms:
+                return "both_sum"
+            if "min" in ms:
+                return "both_min"
+            if "max" in ms:
+                return "both"
             if "оба" in ms or "обе" in ms:
                 return "both"
             if "только d1" in ms:
@@ -1254,18 +1438,18 @@ class KohyaHiresFix(scripts.Script):
                     model.input_blocks[d_i] = Scaler(
                         use_down, model.input_blocks[d_i], scaler_mode,
                         align_mode, recompute_mode,
-                        use_old_float_math=use_old_float_math
+                        use_old_float_math=use_old_float_math,
+                        size_rounding_mode=size_rounding_mode,
                     )
                     model.output_blocks[out_i] = Scaler(
                         use_up, model.output_blocks[out_i], scaler_mode,
                         align_mode, recompute_mode,
-                        use_old_float_math=use_old_float_math
+                        use_old_float_math=use_old_float_math,
+                        size_rounding_mode=size_rounding_mode,
                     )
 
                 if use_smooth:
-                    ratio = float(max(0.0, min(1.0, current / stop_step)))
-                    if algo_mode == "Enhanced (RU+)" and smoothing_curve == "Smoothstep":
-                        ratio = ratio * ratio * (3.0 - 2.0 * ratio)
+                    ratio = curve_progress(current / max(1.0, stop_step), smoothing_curve, smoothing_curve_param)
 
                     cur_down = min((1.0 - use_down) * ratio + use_down, 1.0)
                     model.input_blocks[d_i].scale = cur_down
@@ -1331,6 +1515,7 @@ class KohyaHiresFix(scripts.Script):
 
                 if resolved_pair_mode == "sequential":
                     # 🧠 Режим "как olds.py": обрабатываем пары по очереди, после первой успешной — return
+                    sequential_hit = False
                     for tag, s_stop, d_i in raw_pairs:
                         if s_stop <= 0:
                             continue
@@ -1339,20 +1524,31 @@ class KohyaHiresFix(scripts.Script):
 
                         # olds.py по факту тоже «останавливается» на первой сработавшей паре
                         if did_work:
-                            # После первой активной пары — выходим из callback
-                            return
+                            sequential_hit = True
+                            break
 
                     # Если до сюда дошли — ни одна пара не активна, но могли снять Scaler.
-                    # Ниже сработает onepass-логика.
+                    # Ниже сработает onepass-логика, без раннего return.
 
                 else:
                     # Режим "оба depth одновременно" (и прочие, кроме sequential)
-                    combined: Dict[int, float] = {}
+                    combined: Dict[int, List[float]] = {}
                     for _, s_stop, d_i in raw_pairs:
                         if s_stop > 0 and d_i is not None:
-                            combined[d_i] = max(combined.get(d_i, 0.0), s_stop)
+                            combined.setdefault(d_i, []).append(s_stop)
 
-                    for d_i, s_stop in combined.items():
+                    for d_i, stops in combined.items():
+                        if not stops:
+                            continue
+                        if len(stops) > 1:
+                            if resolved_pair_mode == "both_min":
+                                s_stop = min(stops)
+                            elif resolved_pair_mode == "both_sum":
+                                s_stop = _clamp(sum(stops), 0.0, 1.0)
+                            else:
+                                s_stop = max(stops)
+                        else:
+                            s_stop = stops[0]
                         _apply_depth_pair(d_i, s_stop, current, total)
 
                 # ✅ ИСПРАВЛЕНИЕ 3: УСТАНОВКА ЛИМИТА В КОНЦЕ (End Update)
