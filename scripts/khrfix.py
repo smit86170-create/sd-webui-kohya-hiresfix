@@ -22,6 +22,8 @@ CONFIG_PATH = Path(__file__).with_suffix(".yaml")
 PRESETS_PATH = Path(__file__).with_name(Path(__file__).stem + ".presets.yaml")
 
 CURVE_CHOICES: List[str] = [
+    "Linear",         # <--- Добавили это
+    "Smoothstep",     # <--- И это
     "Constant",
     "Linear Up",
     "Linear Down",
@@ -232,6 +234,14 @@ def unpack_params(cfg: Any, defaults: Dict[str, Any]) -> List[Any]:
 
 def _normalize_curve_name(name: str) -> str:
     n = (name or "").strip().lower()
+
+    # --- НАЧАЛО ВСТАВКИ ---
+    if n == "linear" or n == "линейная":  # Если выбрали "Linear", возвращаем "Linear"
+        return "Linear"
+    if n == "smoothstep":                 # Если выбрали "Smoothstep", возвращаем "Smoothstep"
+        return "Smoothstep"
+    # --- КОНЕЦ ВСТАВКИ ---
+
     if n.startswith("linear") or n.startswith("лин"):
         return "Linear Up"
     if n.startswith("smooth"):
